@@ -1,0 +1,281 @@
+app:
+  name: personal-agent
+  version: 2.0.0
+  env: dev
+
+server:
+  host: 0.0.0.0
+  port: 9000
+  workers: 1
+
+# ==========================================
+# 服务注册 & 第三方工作流集成
+# ==========================================
+services:
+  auth:
+    base_url: http://localhost:8000
+    read_timeout: 30
+  sdxl:
+    base_url: http://localhost:9001
+    read_timeout: 600
+  qwen_image:
+    base_url: http://127.0.0.1:8188
+    text_2_image_path: app/config/workflows/Qwen_Image_2.1_GGUF_Text2Image.json
+    image_2_image_path: app/config/workflows/Qwen_Image_2.1_GGUF_Image2Image_Edit.json
+    read_timeout: 600
+  face_swap:
+    base_url: http://127.0.0.1:8188
+    workflow_path: app/config/workflows/face_swap.json
+    poll_interval: 3
+    poll_timeout: 1800
+    frame_load_cap: 150
+    custom_width: 512
+    custom_height: 512
+  text_to_video:
+    base_url: "http://127.0.0.1:8188"
+    workflow_path: "./app/config/workflows/text_to_video.json"
+    poll_interval: 5
+    poll_timeout: 3600
+    fps: 16
+    max_length: 160
+    nodes:
+      positive_prompt: "6"
+      negative_prompt: "7"
+      sampler: "3"
+      latent: "40"
+      save_nodes: ["28", "47"]
+    presets:
+      standard:
+        width: 640
+        height: 360
+        length: 48
+        steps: 40
+        cfg: 7.5
+      hd:
+        width: 832
+        height: 480
+        length: 48
+        steps: 45
+        cfg: 8.0
+    default_width: 640
+    default_height: 360
+    default_length: 48
+  image_to_video:
+    base_url: "http://127.0.0.1:8188"
+    workflow_path: "./app/config/workflows/wan_i2v.json"
+    poll_interval: 5
+    poll_timeout: 3600
+    fps: 16
+    max_length: 97
+    default_length: 49
+    nodes:
+      start_image: "1"
+      positive_prompt: "5"
+      negative_prompt: "6"
+      latent: "9"
+      sampler: "10"
+      save_nodes: ["12"]
+    presets:
+      standard:
+        max_side: 512
+        steps: 20
+        cfg: 7.5
+      hd:
+        max_side: 640
+        steps: 25
+        cfg: 7.5
+      ultra:
+        max_side: 832
+        steps: 30
+        cfg: 7.5
+
+  tts:
+    # TTS 卸载端点（按你实际引擎填）
+    # CosyVoice2 正确端点可能是 /api/unload、/v1/unload，或根本不存在
+    # 留空则用默认候选（会自动尝试 9010/9011 的 /unload、/api/unload、/v1/unload）
+    unload_urls: []
+    # 如果所有 URL 都失败，是否启用 taskkill 兜底
+    # ⚠️ 会 kill 占用显存 > 1000MB 的非自身进程，请确认安全后再开
+    taskkill_enabled: false
+
+  search:
+    # 留空 = 用 realtime_rules.py 的默认值
+    # 想自定义则填完整列表
+    realtime_keywords: []
+    realtime_patterns: []
+    max_results: 3       # 搜索条数（3 条足够，多了慢）
+    max_chars: 800       # 注入 LLM 的最大字符数（800 字约 3-4 秒生成）
+    fetcher:                  # ⭐ 新增
+      enabled: true
+      max_urls: 3             # 最多抓几个 URL 的正文
+      max_chars_per_url: 2000 # 每个 URL 最多保留多少字
+      timeout: 8              # 单 URL 抓取超时（秒）
+      max_concurrent: 3       # 并发抓取数
+      cache_ttl: 3600         # 缓存时间（秒）
+      circuit_threshold: 5    # 连续失败几次触发熔断
+      circuit_cooldown: 300   # 熔断后冷却多少秒
+      relevance_prefilter: true    # ⭐ 新增：正文相关性预筛
+
+    # 自定义示例（取消注释并填写）：
+    # realtime_keywords:
+    #   - "今天"
+    #   - "最新"
+    #   - "我家附近"       # 加新场景不用改代码
+    #   - "跌到多少"
+    # realtime_patterns:
+    #   - "今天.*新闻"
+    #   - ".*我家附近.*"
+
+  # 自托管 SearXNG（可选）
+  searxng:
+    base_url: ""
+
+
+# ==========================================
+# Ollama 模型服务与 GPU 调度策略
+# ==========================================
+ollama:
+  # 统一基础 URL
+  base_url: "http://localhost:11434/api/chat"
+
+  # 任务模型映射
+  models:
+    intent: "qwen2.5:7b"                         # ← L1/L2 主路由（新增/替换）
+    intent_large: "qwen2.5:14b-instruct-q4_K_M"  # ← 难例兜底（新增）
+    chat: "qwen2.5:7b"    # 主聊天及文档生成
+    reasoning: deepseek-r1:14b           # 深度推理（备用）
+    code: deepseek-coder-v2:16b          # 代码生成
+    vision: qwen2.5vl:7b                 # 视觉理解
+    ocr: deepseek-ocr:latest             # OCR 提取
+    embedding: bge-m3:latest             # RAG 向量化
+
+  # ⭐ 显存常驻策略：-1 表示常驻内存，0 表示用完立刻卸载腾出显存
+  keep_alive:
+    intent: "-1"        # 7B 常驻（4.7GB，8GB 卡可装）
+    intent_large: "0"  # 14B 用完即释放
+    chat: "5m"     # ⭐ 改为 -1m
+    reasoning: "0"
+    code: "0"
+    vision: "0"
+    ocr: "0"
+    embedding: "0"
+
+  default_num_ctx: 16384
+  default_temperature: 0.6
+
+# ==========================================
+# 数据库与中间件
+# ==========================================
+mysql:
+  host: localhost
+  port: 3306
+  database: agent
+  charset: utf8mb4
+  pool_size: 10
+  user: root
+  password: "123456"
+
+redis:
+  host: localhost
+  port: 6379
+  db: 0
+  password: null
+  pool_size: 10
+  token_expire_seconds: 86400
+
+auth:
+  white_list:
+    - /auth/login
+    - /auth/register
+    - /docs
+    - /openapi.json
+    - /health
+    - /agent/v1/thumb/
+    - /agent/v1/image/
+    - /agent/v1/chat/job/
+    - /agent/v1/upload/thumb/
+
+rate_limit:
+  enabled: true
+  default_qps: 10
+  chat_qps: 5
+  upload_qps: 2
+
+file:
+  max_file_tokens: 4096
+  max_file_size_mb: 20
+  allowed_extensions:
+    - pdf
+    - docx
+    - xls
+    - xlsx
+    - txt
+    - md
+    - jpg
+    - jpeg
+    - png
+    - webp
+
+vector_store:
+  path: ./data/chroma
+  collection: knowledge_base
+  chunk_size: 500
+  chunk_overlap: 50
+  top_k: 5
+
+# ==========================================
+# Agent 编排配置
+# ==========================================
+agent:
+  scheduler: router
+  fc_enabled: false
+  enabled: true
+  context:
+    enabled: true
+    window_size: 10
+    summary_trigger_count: 6
+    summary_max_chars: 800
+    summary_async: true
+    summary_service: chat
+    summary_model_key: chat
+    summary_timeout_sec: 120
+
+# 文档生成与长文本处理配置
+doc_processing:
+  # 模型单次最大上下文 Token（本地 qwen2.5:14b 建议设为 8192，未来云端可设为 32000）
+  max_context_tokens: 8192
+  # 预留给 System Prompt 和生成内容的 Token（大概预留 2000）
+  reserved_tokens: 2500
+  # 中文 1 个字大约 1.5 个 Token，用于估算
+  chars_per_token: 1.5
+  # 单次分块的最大字数（防止一次喂给模型的内容太长）
+  chunk_size_chars: 4000
+
+# 在文件末尾追加
+storyboard:
+  mode: single          # ⭐ single（单图运镜，8G 友好） / multi（多图拼接，需 24G+）
+  image_width: 720
+  image_height: 1080
+  zoom_max: 1.15
+  fps: 30
+  output_width: 720
+  output_height: 1280
+  max_scenes: 6         # multi 模式最多 6 个场景
+
+# 在文件末尾追加
+tts:
+  # ⭐ 切换引擎只需改这里：indextts2 / cosyvoice2
+  engine: cosyvoice2
+
+  # 公共参考音频（两个引擎共用）
+  default_ref_audio: "./data/voices/anime_narrator.wav"
+
+  # CosyVoice2 配置
+  cosyvoice2:
+    base_url: "http://127.0.0.1:9011"
+    timeout: 6000
+
+  # IndexTTS2 配置（保留，随时可切回）
+  indextts2:
+    base_url: "http://127.0.0.1:9010"
+    timeout: 6000
