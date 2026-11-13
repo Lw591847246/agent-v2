@@ -1,12 +1,8 @@
-# app/skills/image_understanding/service.py
-"""图片理解业务：描述/OCR/解题。"""
+﻿"""图片理解业务：描述/OCR/解题。"""
 from __future__ import annotations
 
 import base64
 import os
-from typing import Optional
-
-import requests
 
 from app.config.loader import config
 from app.core.logger import logger
@@ -38,10 +34,10 @@ class ImageUnderstandingService:
             model_key = "ocr"
         elif mode == "solve":
             prompt = f"{SOLVE_PROMPT}\n\n用户要求：{question}" if question else SOLVE_PROMPT
-            model_key = "chat"
+            model_key = "vision"
         else:
             prompt = f"用户要求：{question}" if question else DESCRIBE_PROMPT
-            model_key = "chat"
+            model_key = "vision"
 
         logger.info(f"[ImageUnderstanding] mode={mode} model={model_key}")
         return self._call_vlm(prompt, image_b64, model_key)
@@ -71,21 +67,25 @@ class ImageUnderstandingService:
             return ""
 
     @staticmethod
-    def _call_vlm(prompt: str, image_b64: str, model_key: str = "chat") -> str:
-        # 优先用 ollama_client 扩展方法（旧项目有）
+    def _call_vlm(prompt: str, image_b64: str, model_key: str = "vision") -> str:
         if hasattr(ollama_client, "chat_with_image"):
             try:
                 return ollama_client.chat_with_image(prompt, image_b64, model_key=model_key)
             except Exception as e:
                 logger.warning(f"[ImageUnderstanding] chat_with_image 失败，回退: {e}")
 
-        # 回退：直接用 requests 调 Ollama /api/chat
         try:
+            import requests
             host = config.get("ollama.hosts.chat", "http://localhost:11434")
             model = config.get(
                 f"ollama.models.{model_key}",
-                config.get("ollama.models.chat"),
+                config.get("ollama.models.vision") or config.get("ollama.models.chat"),
             )
+            if not model:
+                return "图片理解失败：未配置视觉模型（ollama.models.vision）"
+
+            logger.info(f"[ImageUnderstanding] 调用 {host}/api/chat model={model}")
+
             payload = {
                 "model": model,
                 "messages": [{
@@ -94,9 +94,17 @@ class ImageUnderstandingService:
                     "images": [image_b64],
                 }],
                 "stream": False,
+                "options": {"temperature": 0.2},
             }
             r = requests.post(f"{host}/api/chat", json=payload, timeout=300)
-            r.raise_for_status()
+
+            if r.status_code != 200:
+                logger.error(
+                    f"[ImageUnderstanding] Ollama {r.status_code} "
+                    f"model={model} response={r.text[:500]}"
+                )
+                return f"图片理解失败：Ollama {r.status_code}（模型 {model}）"
+
             return r.json().get("message", {}).get("content", "")
         except Exception as e:
             logger.error(f"[ImageUnderstanding] 调用失败: {e}")

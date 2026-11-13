@@ -1,4 +1,3 @@
-# app/context/task_runner.py
 """异步任务统一入口：create / progress / finish / fail / outputs 落库。"""
 from __future__ import annotations
 
@@ -50,46 +49,42 @@ class TaskRunner:
         session_id: Optional[str] = None,
         message_extra: Optional[dict] = None,
     ) -> None:
-        """
-        完成：更新 task，同时把 content + outputs 写回 message。
+        # ⭐ 1. 先更新会话消息（把图片/视频路径、输出等写入 agent_message）
+        if not session_id:
+            info = task_repo.get(task_id)
+            session_id = info.session_id if info else None
 
-        message_extra：透传给 update_message_content 的额外字段，
-        例如 {"image_filename": "...", "thumb_filename": "...", "message_type": "image"}。
-        """
+        if session_id:
+            try:
+                msg_id = conversation_repo.get_message_id_by_task_id(session_id, task_id)
+                if msg_id:
+                    update_kwargs = {
+                        "message_id": msg_id,
+                        "content": json.dumps(parts, ensure_ascii=False),
+                        "duration_ms": duration_ms,
+                        "outputs": outputs or [],
+                        "message_type": self._infer_type(parts),
+                    }
+                    if message_extra:
+                        update_kwargs.update(message_extra)
+                    conversation_repo.update_message_content(**update_kwargs)
+                    logger.info(f"[TaskRunner] finish 已更新消息 msg_id={msg_id} task_id={task_id}")
+                else:
+                    logger.warning(f"[TaskRunner] finish 找不到 msg_id task_id={task_id}")
+            except Exception as e:
+                logger.warning(f"[TaskRunner] finish update_message failed: {e}")
+        else:
+            logger.warning(f"[TaskRunner] finish 找不到 session_id task_id={task_id}")
+
+        # ⭐ 2. 最后更新任务表状态（前端轮询拿到 done 时，消息表已确保更新完毕）
         try:
             task_repo.finish(
                 task_id, parts=parts, duration_ms=duration_ms,
                 output_path=output_path, outputs=outputs,
             )
+            logger.info(f"[TaskRunner] finish 任务状态已更新为 done task_id={task_id}")
         except Exception as e:
             logger.error(f"[TaskRunner] finish task failed {task_id}: {e}")
-            return
-
-        if not session_id:
-            info = task_repo.get(task_id)
-            session_id = info.session_id if info else None
-        if not session_id:
-            logger.warning(f"[TaskRunner] finish 找不到 session_id task_id={task_id}")
-            return
-
-        try:
-            msg_id = conversation_repo.get_message_id_by_task_id(session_id, task_id)
-            if msg_id:
-                update_kwargs = {
-                    "message_id": msg_id,
-                    "content": json.dumps(parts, ensure_ascii=False),
-                    "duration_ms": duration_ms,
-                    "outputs": outputs or [],
-                    "message_type": self._infer_type(parts),
-                }
-                if message_extra:
-                    update_kwargs.update(message_extra)
-                conversation_repo.update_message_content(**update_kwargs)
-                logger.info(f"[TaskRunner] finish 已更新消息 msg_id={msg_id} task_id={task_id}")
-            else:
-                logger.warning(f"[TaskRunner] finish 找不到 msg_id task_id={task_id}")
-        except Exception as e:
-            logger.warning(f"[TaskRunner] finish update_message failed: {e}")
 
     def fail(self, task_id: str, error: str, session_id: Optional[str] = None) -> None:
         try:

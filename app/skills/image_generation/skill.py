@@ -1,9 +1,8 @@
-# app/skills/image_generation/skill.py
 """ImageGeneration Skill：文生图，异步任务型。"""
 from __future__ import annotations
 
-import json
 import time
+from typing import Optional
 
 from app.context.task_runner import task_runner
 from app.contracts.result import (
@@ -79,23 +78,41 @@ class ImageGenerationSkill(BaseSkill):
         session_id: str, user_id: int,
     ) -> None:
         start = time.time()
+        current_steps = [
+            {"label": "解析参数", "status": "done"},
+            {"label": "生成图片", "status": "running"},
+            {"label": "保存图片", "status": "pending"},
+        ]
         try:
-            task_runner.progress(task_id, 20, "生成图片中...")
+            task_runner.progress(task_id, 20, "生成图片中...", steps=current_steps)
+
             result = image_generation_service.generate(prompt, width, height)
             if not result.get("image_base64"):
                 raise RuntimeError("生图返回空数据")
 
-            task_runner.progress(task_id, 80, "保存图片中...")
+            current_steps[1]["status"] = "done"
+            current_steps[2]["status"] = "running"
+            task_runner.progress(task_id, 80, "保存图片中...", steps=current_steps)
+
             storage = save_image(user_id, session_id, result["image_base64"])
             duration_ms = int((time.time() - start) * 1000)
 
-            # 找 msg_id（skill_progress 卡片消息里有 task_id）
+            if not session_id:
+                from app.infrastructure.repositories.task_repo import task_repo
+                info = task_repo.get(task_id)
+                if info and info.session_id:
+                    session_id = info.session_id
+
             msg_id = conversation_repo.get_message_id_by_task_id(session_id, task_id)
 
             if msg_id:
                 image_url = f"/agent/v1/image/{msg_id}"
                 thumb_url = f"/agent/v1/thumb/{msg_id}"
-                parts = [image_part(image_url, thumb_url)]
+                # ⭐ 核心：添加 text_part，实现“上方图片，下方文字”
+                parts = [
+                    image_part(image_url, thumb_url),
+                    text_part("图片已生成"),
+                ]
                 outputs = [build_output(
                     kind="image",
                     filename=storage["filename"],
@@ -119,18 +136,15 @@ class ImageGenerationSkill(BaseSkill):
                 )
                 logger.info(f"[ImageGeneration] 完成 task_id={task_id} msg_id={msg_id}")
             else:
-                # 消息还没落库，降级只更新任务表
+                logger.warning(f"[ImageGeneration] 找不到 msg_id task_id={task_id} session_id={session_id}")
                 parts = [text_part("图片已生成，但消息未找到")]
                 task_runner.finish(
                     task_id=task_id, parts=parts,
                     duration_ms=duration_ms, session_id=session_id,
                 )
-                logger.warning(f"[ImageGeneration] 找不到 msg_id task_id={task_id}")
         except Exception as e:
             logger.error(f"[ImageGeneration] 失败 task_id={task_id}: {e}", exc_info=True)
             task_runner.fail(task_id, str(e), session_id=session_id)
 
-
-from typing import Optional  # noqa: E402
 
 skill = ImageGenerationSkill()

@@ -1,4 +1,3 @@
-# app/skills/text_to_video/service.py
 """文生视频业务：ComfyUI 提交 → 轮询 → 下载 → 保存。"""
 from __future__ import annotations
 
@@ -11,6 +10,7 @@ from typing import Optional
 
 from app.core.logger import logger
 from app.infrastructure.clients.comfyui_t2v_client import comfyui_t2v_client
+from app.infrastructure.clients.gpu_lock import gpu_lock
 
 
 VIDEO_OUTPUT_ROOT = "./data/videos"
@@ -18,7 +18,6 @@ _MAX_DURATION = 20
 
 
 def _convert_to_mp4(content: bytes, task_id: str) -> bytes:
-    """如果不是 mp4/mov，用 ffmpeg 转成 mp4。"""
     tmp_in = tempfile.NamedTemporaryFile(suffix=".bin", delete=False)
     tmp_in.write(content)
     tmp_in.close()
@@ -68,7 +67,6 @@ class TextToVideoService:
         preset: str = "standard", duration_seconds: Optional[int] = None,
         provider: str = "comfyui",
     ) -> dict:
-        """提交参数，返回 {prompt, negative_prompt, preset, duration_seconds, length}"""
         length = None
         if duration_seconds and duration_seconds > 0:
             fps = comfyui_t2v_client.fps
@@ -88,7 +86,6 @@ class TextToVideoService:
         preset: str = "standard", length: Optional[int] = None,
         progress_cb=None,
     ) -> str:
-        """执行生成，返回保存路径。progress_cb(pct, msg, steps)"""
         start = time.time()
         steps = [
             {"label": "解析参数", "status": "done"},
@@ -98,22 +95,25 @@ class TextToVideoService:
         if progress_cb:
             progress_cb(5, "提交任务...", steps)
 
-        prompt_id = comfyui_t2v_client.submit(
-            prompt=prompt, negative_prompt=negative_prompt,
-            preset=preset, length=length, prefix=f"t2v_{task_id}",
-        )
-        logger.info(f"[T2V] 提交成功 task={task_id} prompt_id={prompt_id}")
+        # ⭐ 关键：文生视频在 ComfyUI 里跑，必须抢 GPU 锁
+        with gpu_lock.acquire(task_name="comfyui_t2v", timeout=600):
+            logger.info(f"[T2V] GPU 锁已获取 task={task_id}")
+            prompt_id = comfyui_t2v_client.submit(
+                prompt=prompt, negative_prompt=negative_prompt,
+                preset=preset, length=length, prefix=f"t2v_{task_id}",
+            )
+            logger.info(f"[T2V] 提交成功 task={task_id} prompt_id={prompt_id}")
 
-        if progress_cb:
-            progress_cb(10, "生成中...", steps)
+            if progress_cb:
+                progress_cb(10, "生成中...", steps)
 
-        output_info = comfyui_t2v_client.wait_for(prompt_id)
+            output_info = comfyui_t2v_client.wait_for(prompt_id)
 
-        if progress_cb:
-            progress_cb(90, "下载并转换中...", steps)
+            if progress_cb:
+                progress_cb(90, "下载并转换中...", steps)
 
-        content = comfyui_t2v_client.download_output(output_info)
-        content = _convert_to_mp4(content, task_id)
+            content = comfyui_t2v_client.download_output(output_info)
+            content = _convert_to_mp4(content, task_id)
 
         user_dir = os.path.join(VIDEO_OUTPUT_ROOT, str(user_id), session_id or "default")
         os.makedirs(user_dir, exist_ok=True)
@@ -126,9 +126,9 @@ class TextToVideoService:
         logger.info(f"[T2V] 完成 task={task_id} 耗时={int((time.time()-start)*1000)}ms")
         return save_path
 
-    # ---------- 参数提取 ----------
     @staticmethod
     def detect_preset(text: str) -> str:
+        from app.skills.text_to_video.prompts import _PRESET_KEYWORDS
         lower = (text or "").lower()
         for preset, kws in _PRESET_KEYWORDS:
             for kw in kws:
@@ -155,8 +155,5 @@ class TextToVideoService:
                     pass
         return None
 
-
-# 延迟导入，避免循环
-from app.skills.text_to_video.prompts import _PRESET_KEYWORDS  # noqa: E402
 
 text_to_video_service = TextToVideoService()

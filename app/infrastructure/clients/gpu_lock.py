@@ -1,4 +1,4 @@
-"""GPU 资源池锁（向后兼容版）。"""
+"""GPU 资源池锁：同资源复用、异资源卸载、全局串行。"""
 from __future__ import annotations
 
 import subprocess
@@ -58,7 +58,6 @@ def _map_task_name(task_name: str) -> GPUResource:
 
 
 def _get_gpu_used_mb() -> int:
-    """查询显存使用（MB），失败返回 -1。"""
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.used",
@@ -73,7 +72,6 @@ def _get_gpu_used_mb() -> int:
 
 
 def _get_gpu_total_mb() -> int:
-    """查询总显存（MB），失败返回 0。"""
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total",
@@ -88,7 +86,6 @@ def _get_gpu_total_mb() -> int:
 
 
 def _log_gpu_status(label: str):
-    """打显存状态：xxx MB / yyy MB (zz%)"""
     used = _get_gpu_used_mb()
     if used >= 0:
         total = _get_gpu_total_mb()
@@ -171,12 +168,12 @@ def _unload_resource(resource: GPUResource):
 
 
 class GlobalGPULock:
+    """全局 GPU 资源锁：同资源复用，异资源卸载。"""
 
     def __init__(self):
         self._lock = threading.RLock()
         self._current: GPUResource = GPUResource.NONE
         self._current_since: float = 0.0
-        # ★ 新增：当前持锁的任务名，用于日志
         self._current_task: str = ""
 
     def current(self) -> GPUResource:
@@ -184,7 +181,6 @@ class GlobalGPULock:
 
     @contextmanager
     def _acquire_internal(self, resource: GPUResource, task_name: str, timeout: int):
-        # ★ 1. 获取前打显存
         _log_gpu_status(f"请求前 (task={task_name})")
         logger.info(f"【GPU调度】任务 [{task_name}] 等待占用 GPU...")
 
@@ -204,7 +200,6 @@ class GlobalGPULock:
                 logger.info(
                     f"【GPU调度】任务 [{task_name}] 复用资源 [{resource.value}]（无需切换）"
                 )
-                # ★ 2. 复用资源也打显存
                 _log_gpu_status(f"复用 {resource.value}")
             else:
                 logger.info(
@@ -224,7 +219,6 @@ class GlobalGPULock:
             logger.info(f"【GPU调度】任务 [{task_name}] 执行完毕，释放 GPU。")
             self._current_task = ""
             self._lock.release()
-            # ★ 3. release 后打显存
             _log_gpu_status(f"释放后 (task={task_name})")
 
     @contextmanager

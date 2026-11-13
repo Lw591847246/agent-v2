@@ -1,4 +1,4 @@
-app:
+﻿app:
   name: personal-agent
   version: 2.0.0
   env: dev
@@ -146,7 +146,7 @@ ollama:
     reasoning: deepseek-r1:14b           # 深度推理（备用）
     code: deepseek-coder-v2:16b          # 代码生成
     vision: qwen2.5vl:7b                 # 视觉理解
-    ocr: deepseek-ocr:latest             # OCR 提取
+    ocr: qwen2.5vl:7b             # OCR 提取
     embedding: bge-m3:latest             # RAG 向量化
 
   # ⭐ 显存常驻策略：-1 表示常驻内存，0 表示用完立刻卸载腾出显存
@@ -192,7 +192,6 @@ auth:
     - /health
     - /agent/v1/thumb/
     - /agent/v1/image/
-    - /agent/v1/chat/job/
     - /agent/v1/upload/thumb/
 
 rate_limit:

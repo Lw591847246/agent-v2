@@ -1,4 +1,4 @@
-﻿"""任务进度 + 视频下载（Range 支持）。"""
+﻿"""任务进度 + 视频下载（Range 支持）。返回标准 Result 协议。"""
 import os
 
 from fastapi import APIRouter, HTTPException, Request
@@ -16,23 +16,15 @@ def get_job_status(task_id: str) -> dict:
     if not info:
         raise HTTPException(status_code=404, detail="task not found")
 
-    data = info.model_dump()
+    # ⭐ 解析 steps / parts / outputs
+    progress_data = task_repo.get_progress(task_id) or {}
+
     file_size = 0
     if info.output_path and os.path.isfile(info.output_path):
         try:
             file_size = os.stat(info.output_path).st_size
         except Exception:
             pass
-    data["file_size"] = file_size
-
-    if info.status == "done":
-        data["video_url"] = f"/agent/v1/job/{task_id}/video"
-    else:
-        data["video_url"] = None
-
-    slots = info.slots or {}
-    data["summary"] = slots.get("summary") or slots.get("prompt") or "AI 生成"
-    data["agent_trace"] = slots.get("agent_trace", [])
 
     duration_ms = 0
     if info.created_at and info.finished_at:
@@ -43,8 +35,20 @@ def get_job_status(task_id: str) -> dict:
             duration_ms = max(0, int((t1 - t0).total_seconds() * 1000))
         except Exception:
             pass
-    data["duration_ms"] = duration_ms
-    return data
+
+    # ⭐ 返回标准 Result
+    return {
+        "task_id": task_id,
+        "status": info.status,
+        "progress": info.progress,
+        "msg": progress_data.get("msg", ""),
+        "steps": progress_data.get("steps", []),
+        "parts": progress_data.get("parts", []),
+        "outputs": progress_data.get("outputs", []),
+        "error": info.error,
+        "duration_ms": duration_ms,
+        "file_size": file_size,
+    }
 
 
 @router.get("/agent/v1/job/{task_id}/video")

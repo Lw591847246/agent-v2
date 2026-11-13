@@ -22,7 +22,7 @@ from app.infrastructure.repositories.task_repo import task_repo
 from app.application.file_upload_service import file_upload_service
 from app.domain.models.task import TaskInfo
 from app.utils.file_registry import file_registry
-
+from app.infrastructure.clients.gpu_lock import gpu_lock
 
 VIDEO_OUTPUT_ROOT = "./data/videos"
 GROUP_KEY_PREFIX = "face_swap:group:"
@@ -191,10 +191,12 @@ class FaceSwapService:
             steps[1]["status"] = "running"
             task_runner.progress(task_id, 20, "提交 ComfyUI 换脸...", steps=steps)
 
-            prompt_id = comfyui_face_swap_client.submit(
-                source_image_name=src_name, video_name=vid_name,
-                prefix=f"face_swap_{task_id}",
-            )
+            with gpu_lock.acquire(task_name="comfyui_face_swap", timeout=600):
+                prompt_id = comfyui_face_swap_client.submit(
+                    source_image_name=src_name, video_name=vid_name,
+                    prefix=f"face_swap_{task_id}",
+                )
+
             task_repo.update(
                 task_id, provider_job_id=prompt_id, status="running", progress=30,
             )
