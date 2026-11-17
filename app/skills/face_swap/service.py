@@ -22,7 +22,7 @@ from app.infrastructure.repositories.task_repo import task_repo
 from app.application.file_upload_service import file_upload_service
 from app.domain.models.task import TaskInfo
 from app.utils.file_registry import file_registry
-from app.infrastructure.clients.gpu_lock import gpu_lock
+from app.core.gpu_lock import gpu_lock
 
 VIDEO_OUTPUT_ROOT = "./data/videos"
 GROUP_KEY_PREFIX = "face_swap:group:"

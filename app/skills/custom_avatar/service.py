@@ -12,7 +12,7 @@ from app.context.task_runner import task_runner
 from app.contracts.result import build_output
 from app.core.logger import logger
 from app.infrastructure.clients.comfyui_i2v_client import comfyui_i2v_client
-from app.infrastructure.clients.gpu_lock import gpu_lock
+from app.core.gpu_lock import gpu_lock
 from app.infrastructure.services.lipsync_service import lipsync_service
 from app.infrastructure.services.tts_service import tts_service
 from app.skills.custom_avatar.prompts import (

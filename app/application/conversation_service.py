@@ -3,13 +3,16 @@ import re
 import threading
 import uuid
 from typing import Any, Dict, List, Optional
+import contextvars
 
 from app.core.exceptions import NotFoundException
+from app.core.gpu_lock import GPUResource, gpu_lock
 from app.core.logger import logger
 from app.domain.repositories.conversation_repository import ConversationRepository
 from app.infrastructure.clients.ollama_client import ollama_client
 from app.infrastructure.repositories.conversation_repo import conversation_repo
 from app.utils.content_parser import parse_content_for_llm
+from app.core.llm_tracker import track_llm
 
 _summary_locks: Dict[str, threading.Lock] = {}
 
@@ -112,8 +115,10 @@ class ConversationService:
         self._repo.update_title(session_id, title)
         logger.info(f"【标题】本地规则生成: {title}")
 
+        ctx = contextvars.copy_context()
         threading.Thread(
-            target=self._async_optimize_title, args=(session_id, text), daemon=True,
+            target=ctx.run, args=(self._async_optimize_title, session_id, text),
+            daemon=True,
         ).start()
 
     def _async_optimize_title(self, session_id: str, text: str):
@@ -122,11 +127,13 @@ class ConversationService:
                 f"请为以下对话生成一个不超过 12 个字的简短标题，"
                 f"只输出标题文字，不要标点、不要引号、不要解释：\n\n{text}"
             )
-            result = ollama_client.chat(
-                service="intent", model_key="intent",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-            )
+            # ⭐ 标题优化是独立后台线程，独立抢锁；短任务超时 60s
+            with gpu_lock.lease(GPUResource.OLLAMA_CHAT, task="title-opt", timeout=60):
+                result = ollama_client.chat(
+                    service="intent", model_key="intent",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                )
             new_title = result.strip().strip('"').strip("'").strip("。").strip()
             if 3 <= len(new_title) <= 20:
                 self._repo.update_title(session_id, new_title)
@@ -161,12 +168,18 @@ class ConversationService:
         thumb_filename: Optional[str] = None,
         duration_ms: Optional[int] = None,
         project_id: Optional[int] = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        total_cost: float = 0.0
     ) -> int:
         return self._repo.save_assistant_message(
             session_id=session_id, content=content, message_type=message_type,
             outputs=outputs, image_filename=image_filename,
             thumb_filename=thumb_filename, duration_ms=duration_ms,
             project_id=project_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_cost=total_cost,
         )
 
     def get_recent_outputs(
@@ -181,7 +194,7 @@ class ConversationService:
     def find_referenced_outputs(
         self, session_id: str, referent: Any, max_lookback: int = 20,
     ) -> List[Dict[str, Any]]:
-        """解析引用 + 挑产出。V2 改：用 pick_outputs_strict（返回 dict）。"""
+        """解析引用 + 挑产出。V2 收紧：用 pick_outputs_strict（返回 dict）。"""
         from app.context.reference_resolver import pick_outputs_strict
 
         history = self.get_recent_outputs(session_id, limit=max_lookback)
@@ -324,11 +337,13 @@ class ConversationService:
         )
 
         try:
-            result = ollama_client.chat(
-                service=svc, model_key=mkey,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-            )
+            # ⭐ 摘要是后台线程的长 LLM 调用，独立抢锁；超时 180s
+            with gpu_lock.lease(GPUResource.OLLAMA_CHAT, task="summary", timeout=180):
+                result = ollama_client.chat(
+                    service=svc, model_key=mkey,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                )
             new_summary = (result or "").strip()
             if len(new_summary) < 10:
                 return

@@ -41,36 +41,48 @@ class OllamaClient:
         url = self._get_url(service)
         payload = self._build_payload(model_key, messages, False, keep_alive, format, temperature)
 
-        try:
-            res = requests.post(url, json=payload, timeout=300)
-            if res.status_code != 200:
-                logger.error(f"【OllamaClient】400报错详情: {res.text}")
-            res.raise_for_status()
-            return res.json().get("message", {}).get("content", "")
-        except Exception as e:
-            logger.error(f"【OllamaClient】请求失败: {e}")
-            raise e
+        from app.core.llm_tracker import track_llm
+
+        with track_llm(service=service, model_key=model_key) as t:
+            try:
+                res = requests.post(url, json=payload, timeout=300)
+                if res.status_code != 200:
+                    logger.error(f"【OllamaClient】HTTP {res.status_code}: {res.text[:500]}")
+                res.raise_for_status()
+
+                data = res.json()
+                # ✅ 关键：从原始 dict 里取 token，再返回 content
+                t.from_ollama_response(data)
+
+                return data.get("message", {}).get("content", "")
+            except Exception as e:
+                logger.error(f"【OllamaClient】请求失败: {e}")
+                raise e
 
     def stream(self, service: str, model_key: str, messages: list, keep_alive: str = "-1", temperature: float = 0.6):
         url = self._get_url(service)
         payload = self._build_payload(model_key, messages, True, keep_alive, "", temperature)
 
-        try:
-            with requests.post(url, json=payload, stream=True, timeout=300) as r:
-                if r.status_code != 200:
-                    logger.error(f"【OllamaClient】流式400报错详情: {r.text}")
-                r.raise_for_status()
-                for line in r.iter_lines():
-                    if line:
-                        data = json.loads(line)
-                        chunk = data.get("message", {}).get("content", "")
-                        if chunk:
-                            yield chunk
-                        if data.get("done"):
-                            break
-        except Exception as e:
-            logger.error(f"【OllamaClient】流式请求失败: {e}")
-            raise e
+        from app.core.llm_tracker import track_llm
+
+        with track_llm(service=service, model_key=model_key) as t:
+            try:
+                with requests.post(url, json=payload, stream=True, timeout=300) as r:
+                    if r.status_code != 200:
+                        logger.error(f"【OllamaClient】流式 HTTP {r.status_code}: {r.text[:500]}")
+                    r.raise_for_status()
+                    for line in r.iter_lines():
+                        if line:
+                            data = json.loads(line)
+                            t.from_ollama_chunk(data)  # ← 每行都喂，done=true 时记录 token
+                            chunk = data.get("message", {}).get("content", "")
+                            if chunk:
+                                yield chunk
+                            if data.get("done"):
+                                break
+            except Exception as e:
+                logger.error(f"【OllamaClient】流式请求失败: {e}")
+                raise e
 
 
 ollama_client = OllamaClient()

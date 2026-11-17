@@ -11,7 +11,7 @@ from typing import Optional
 
 from app.core.logger import logger
 from app.infrastructure.clients.comfyui_i2v_client import comfyui_i2v_client
-from app.infrastructure.clients.gpu_lock import gpu_lock
+from app.core.gpu_lock import gpu_lock
 from app.infrastructure.clients.model_manager import model_manager
 from app.infrastructure.repositories.conversation_repo import conversation_repo
 from app.infrastructure.services.lipsync_service import lipsync_service

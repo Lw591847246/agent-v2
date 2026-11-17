@@ -13,7 +13,17 @@ import requests
 
 from app.config.loader import config
 from app.core.logger import logger
+from pathlib import Path
 
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+
+
+def _resolve_path(p: str) -> str:
+    if not p:
+        return ""
+    if os.path.isabs(p):
+        return p
+    return str(_PROJECT_ROOT / p.lstrip("./"))
 
 class FaceSwapException(Exception):
     pass
@@ -23,7 +33,13 @@ class ComfyUIFaceSwapClient:
 
     def __init__(self):
         self.base_url = (config.get("services.face_swap.base_url") or "").rstrip("/")
-        self.workflow_path = config.get("services.face_swap.workflow_path")
+
+        # ⭐ 绝对路径
+        raw_path = config.get("services.face_swap.workflow_path", "")
+        self.workflow_path = _resolve_path(raw_path)
+        logger.info(f"[FaceSwapClient] workflow_path 原值 = {raw_path!r}")
+        logger.info(f"[FaceSwapClient] workflow_path 解析后 = {self.workflow_path!r}, exists={os.path.isfile(self.workflow_path)}")
+
         self.poll_interval = int(config.get("services.face_swap.poll_interval", 3))
         self.poll_timeout = int(config.get("services.face_swap.poll_timeout", 1800))
         self.frame_load_cap = int(config.get("services.face_swap.frame_load_cap", 60))
@@ -31,17 +47,18 @@ class ComfyUIFaceSwapClient:
         self.custom_height = int(config.get("services.face_swap.custom_height", 512))
         self._template: Optional[dict] = None
 
-    # ---------- workflow ----------
-
     def _load_workflow(self) -> dict:
         if self._template is not None:
             return self._template
         if not self.workflow_path:
             raise FaceSwapException("未配置 services.face_swap.workflow_path")
         if not os.path.isfile(self.workflow_path):
-            raise FaceSwapException(f"工作流文件不存在: {self.workflow_path}")
+            raise FaceSwapException(
+                f"工作流文件不存在: {self.workflow_path!r} (cwd={os.getcwd()!r})"
+            )
         with open(self.workflow_path, "r", encoding="utf-8") as f:
             self._template = json.load(f)
+        logger.info(f"[FaceSwapClient] ✅ 工作流加载成功: {self.workflow_path}")
         return self._template
 
     # ---------- video fix ----------

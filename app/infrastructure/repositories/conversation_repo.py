@@ -154,18 +154,23 @@ class ConversationRepoImpl(BaseRepo, ConversationRepository):
         thumb_filename: Optional[str] = None,
         duration_ms: Optional[int] = None,
         project_id: Optional[int] = None,
+        input_tokens: Optional[int] = 0,
+        output_tokens: Optional[int] = 0,
+        total_cost: Optional[float] = 0.0
     ) -> int:
         outputs_json = json.dumps(outputs, ensure_ascii=False) if outputs else None
         sql = """
             INSERT INTO agent_message
                 (session_id, role, content, message_type, outputs,
-                 image_filename, thumb_filename, duration_ms, project_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+         image_filename, thumb_filename, duration_ms, project_id,
+         input_tokens, output_tokens, total_cost)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """
         with self.cursor(commit=True) as cur:
             cur.execute(sql, (
                 session_id, "assistant", content, message_type, outputs_json,
                 image_filename, thumb_filename, duration_ms, project_id,
+                input_tokens, output_tokens, total_cost,
             ))
             mid = cur.lastrowid
             logger.info(f"[Repo] save_assistant_message id={mid} type={message_type}")

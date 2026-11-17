@@ -29,7 +29,7 @@ class ImageToVideoSkill(BaseSkill):
             "speech_text": {"type": "string", "description": "可选，角色要说的台词"},
             "duration_seconds": {"type": "integer", "description": "时长（秒），可选，默认 5s，上限 5s"},
             "preset": {"type": "string", "description": "清晰度档位：standard / hd / ultra"},
-            "voice": {"type": "string", "description": "音色，可选，默认 zf_xiaoxiao"},
+            "voices": {"type": "string", "description": "音色，可选，默认 zf_xiaoxiao"},
         },
         "required": ["image_file_id", "prompt"],
     }

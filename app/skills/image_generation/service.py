@@ -5,7 +5,7 @@ import json
 from typing import Optional
 
 from app.core.logger import logger
-from app.infrastructure.clients.gpu_lock import gpu_lock
+from app.core.gpu_lock import gpu_lock
 from app.infrastructure.clients.qwen_Image_client import qwen_image_client
 
 

@@ -13,18 +13,33 @@ from PIL import Image
 
 from app.config.loader import config
 from app.core.logger import logger
+from pathlib import Path
 
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+
+
+def _resolve_path(p: str) -> str:
+    if not p:
+        return ""
+    if os.path.isabs(p):
+        return p
+    return str(_PROJECT_ROOT / p.lstrip("./"))
 
 class ImageToVideoException(Exception):
     pass
 
 
 class ComfyUIImageToVideoClient:
-
     def __init__(self):
         base = config.get("services.image_to_video", {}) or {}
         self.base_url = (base.get("base_url") or "").rstrip("/")
-        self.workflow_path = base.get("workflow_path")
+
+        # ⭐ 绝对路径解析
+        raw_path = base.get("workflow_path", "")
+        self.workflow_path = _resolve_path(raw_path)
+        logger.info(f"[I2VClient] workflow_path 原值 = {raw_path!r}")
+        logger.info(f"[I2VClient] workflow_path 解析后 = {self.workflow_path!r}, exists={os.path.isfile(self.workflow_path)}")
+
         self.poll_interval = int(base.get("poll_interval", 5))
         self.poll_timeout = int(base.get("poll_timeout", 3600))
         self.fps = int(base.get("fps", 16))
@@ -32,20 +47,20 @@ class ComfyUIImageToVideoClient:
         self.default_length = int(base.get("default_length", 49))
         self.nodes = base.get("nodes", {}) or {}
         self.presets = base.get("presets", {}) or {}
-
         self._template: Optional[dict] = None
-
-    # ---------- workflow ----------
 
     def _load_workflow(self) -> dict:
         if self._template is not None:
             return self._template
         if not self.workflow_path or not os.path.isfile(self.workflow_path):
-            raise ImageToVideoException(f"工作流不存在: {self.workflow_path}")
+            raise ImageToVideoException(
+                f"工作流不存在: {self.workflow_path!r} "
+                f"(cwd={os.getcwd()!r})"
+            )
         with open(self.workflow_path, "r", encoding="utf-8") as f:
             self._template = json.load(f)
+        logger.info(f"[I2VClient] ✅ 工作流加载成功: {self.workflow_path}")
         return self._template
-
     # ---------- 尺寸计算（核心） ----------
 
     @staticmethod

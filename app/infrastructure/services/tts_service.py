@@ -1,8 +1,16 @@
 ﻿# app/application/tts_service.py
-"""TTS 服务：配置驱动，支持 IndexTTS2 / CosyVoice2 平滑切换"""
+"""TTS 服务：配置驱动，支持 IndexTTS2 / CosyVoice2 平滑切换。
+
+GPU 锁说明：
+- 同步方法用 `with gpu_lock.lease(...)`
+- 异步方法用 `async with gpu_lock.async_lease(...)`（不阻塞事件循环）
+- 锁粒度 = 一次合成请求（含上游推理 + 落盘）
+- 资源类型按 config.tts.engine 自动选择 INDEXTTS2 / COSYVOICE2
+"""
 import os
 
 from app.config.loader import config
+from app.core.gpu_lock import GPUResource, gpu_lock
 from app.core.logger import logger
 from app.infrastructure.tts.base import BaseTTSEngine
 from app.infrastructure.tts.indextts_engine import IndexTTSEngine
@@ -40,23 +48,47 @@ class TtsService:
             )
             logger.info(f"[TtsService] ✅ 使用 IndexTTS2 引擎 ({base_url})")
 
+    # ⭐ 根据当前 engine 选择 GPU 资源类型；不影响接口
+    def _resource(self) -> GPUResource:
+        name = (config.get("tts.engine", "indextts2") or "indextts2").lower()
+        return GPUResource.COSYVOICE2 if name == "cosyvoice2" else GPUResource.INDEXTTS2
+
+    def _timeout(self) -> int:
+        name = (config.get("tts.engine", "indextts2") or "indextts2").lower()
+        if name == "cosyvoice2":
+            return int(config.get("tts.cosyvoice2.timeout", "6000"))
+        return int(config.get("tts.indextts2.timeout", "6000"))
+
     # ============================================================
-    # 对外接口 —— 与原来完全一致（Agent 端零改动）
+    # 对外接口（签名与原来完全一致）
     # ============================================================
 
     def synthesize_wav(self, text: str, voice: str = "") -> str:
-        return self._engine.synthesize_wav(text, voice)
+        # 同步方法：直接 with 锁
+        with gpu_lock.lease(
+            self._resource(), task="tts-wav", timeout=self._timeout(),
+        ):
+            return self._engine.synthesize_wav(text, voice)
 
     async def synthesize(self, text: str, voice: str = ""):
-        return await self._engine.synthesize(text, voice)
+        # 异步方法：async with，不阻塞事件循环
+        async with gpu_lock.async_lease(
+            self._resource(), task="tts", timeout=self._timeout(),
+        ):
+            return await self._engine.synthesize(text, voice)
 
     async def synthesize_with_timeline(
         self, text: str, voice: str = "", speed: float = 1.05,
         task_id: str = "", tts_params: dict = None,
     ):
-        return await self._engine.synthesize_with_timeline(
-            text, voice, speed, task_id, tts_params
-        )
+        async with gpu_lock.async_lease(
+            self._resource(), task="tts-timeline", timeout=self._timeout(),
+        ):
+            return await self._engine.synthesize_with_timeline(
+                text, voice, speed, task_id, tts_params
+            )
+
+    # ---- 以下不占 GPU，不加锁 ----
 
     def list_voices(self):
         return self._engine.list_voices()

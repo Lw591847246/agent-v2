@@ -10,7 +10,7 @@ from typing import Optional
 
 from app.core.logger import logger
 from app.infrastructure.clients.comfyui_t2v_client import comfyui_t2v_client
-from app.infrastructure.clients.gpu_lock import gpu_lock
+from app.core.gpu_lock import gpu_lock
 
 
 VIDEO_OUTPUT_ROOT = "./data/videos"

@@ -1,16 +1,11 @@
-"""ComfyUI 文生视频客户端：提交工作流 → 轮询 → 下载视频
-
-节点定位策略（双保险）：
-  1. 优先从配置 services.text_to_video.nodes 读取节点 ID
-  2. 配置缺失时，按 _meta.title 关键词自动探测
-  3. 两者都失败时抛异常
-"""
+"""ComfyUI 文生视频客户端：提交工作流 → 轮询 → 下载视频"""
 from __future__ import annotations
 
 import copy
 import json
 import os
 import time
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -19,15 +14,29 @@ from app.config.loader import config
 from app.core.logger import logger
 
 
+# ⭐ 项目根绝对路径，不依赖 cwd
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+logger.info(f"[T2VClient] 项目根 = {_PROJECT_ROOT}")
+
+
+def _resolve_path(p: str) -> str:
+    """把相对路径统一解析到项目根下。"""
+    if not p:
+        return ""
+    if os.path.isabs(p):
+        return p
+    return str(_PROJECT_ROOT / p.lstrip("./"))
+
+
 class TextToVideoException(Exception):
     pass
 
 
 _NODE_TITLE_HINTS = {
-    "positive_prompt": ["positive prompt", "positive", "正面", "正向", "正面提示词"],
-    "negative_prompt": ["negative prompt", "negative", "负面", "反向", "负面提示词"],
-    "sampler":         ["ksample", "k采样", "采样器", "ksampler"],
-    "latent":          ["empty", "空latent", "空latent视频", "hunyuan", "空"],
+    "positive_prompt": ["positive prompt", "positive", "正面", "正向"],
+    "negative_prompt": ["negative prompt", "negative", "负面", "反向"],
+    "sampler": ["ksample", "k采样", "采样器", "ksampler"],
+    "latent": ["empty", "空latent", "空latent视频", "hunyuan", "空"],
 }
 
 _SAVE_CLASS_TYPES = {"SaveWEBM", "SaveAnimatedWEBP", "VHS_VideoCombine", "SaveVideo"}
@@ -38,11 +47,16 @@ class ComfyUITextToVideoClient:
     def __init__(self):
         base = config.get("services.text_to_video", {}) or {}
         self.base_url = (base.get("base_url") or "").rstrip("/")
-        self.workflow_path = base.get("workflow_path")
+
+        # ⭐ 关键：把 workflow_path 解析成绝对路径
+        raw_path = base.get("workflow_path", "")
+        self.workflow_path = _resolve_path(raw_path)
+        logger.info(f"[T2VClient] workflow_path 原始值 = {raw_path!r}")
+        logger.info(f"[T2VClient] workflow_path 解析后 = {self.workflow_path!r}")
+        logger.info(f"[T2VClient] 文件存在 = {os.path.isfile(self.workflow_path)}")
+
         self.poll_interval = int(base.get("poll_interval", 5))
         self.poll_timeout = int(base.get("poll_timeout", 3600))
-
-        # ⭐ 帧率 + 时长上限（供 Handler/Service 换算）
         self.fps = int(base.get("fps", 16))
         self.max_length = int(base.get("max_length", 160))
 
@@ -72,9 +86,15 @@ class ComfyUITextToVideoClient:
         if not self.workflow_path:
             raise TextToVideoException("未配置 services.text_to_video.workflow_path")
         if not os.path.isfile(self.workflow_path):
+            logger.error(
+                f"[T2VClient] ❌ 工作流文件不存在: {self.workflow_path!r}\n"
+                f"  cwd = {os.getcwd()!r}\n"
+                f"  目录 = {os.path.dirname(self.workflow_path)!r}"
+            )
             raise TextToVideoException(f"工作流文件不存在: {self.workflow_path}")
         with open(self.workflow_path, "r", encoding="utf-8") as f:
             self._template = json.load(f)
+        logger.info(f"[T2VClient] ✅ 工作流加载成功: {self.workflow_path}")
         return self._template
 
     def _find_node_by_hint(self, workflow: dict, hints: list) -> Optional[str]:
@@ -89,9 +109,7 @@ class ComfyUITextToVideoClient:
         if len(matched) == 1:
             return matched[0]
         if len(matched) > 1:
-            logger.warning(
-                f"[T2VClient] 关键词 {hints} 匹配到多个节点 {matched}，请手动在 YAML 配置"
-            )
+            logger.warning(f"[T2VClient] 关键字 {hints} 匹配到多个节点 {matched}，请手动配置")
         return None
 
     def _resolve_node(self, workflow: dict, key: str) -> str:
@@ -124,27 +142,18 @@ class ComfyUITextToVideoClient:
         if found:
             logger.info(f"[T2VClient] 自动探测保存节点 -> {found}")
             return found
-        raise TextToVideoException(
-            "未找到任何保存节点，请在 YAML 的 nodes.save_nodes 手动指定"
-        )
+        raise TextToVideoException("未找到任何保存节点，请在 YAML 中手动指定 nodes.save_nodes")
 
     def submit(
-        self,
-        prompt: str,
-        negative_prompt: str = "",
-        preset: str = "standard",
-        seed: Optional[int] = None,
-        width: Optional[int] = None,
-        height: Optional[int] = None,
-        length: Optional[int] = None,
-        steps: Optional[int] = None,
-        cfg: Optional[float] = None,
-        prefix: str = "t2v",
+        self, prompt: str, negative_prompt: str = "",
+        preset: str = "standard", seed: Optional[int] = None,
+        width: Optional[int] = None, height: Optional[int] = None,
+        length: Optional[int] = None, steps: Optional[int] = None,
+        cfg: Optional[float] = None, prefix: str = "t2v",
     ) -> str:
         p = self.presets.get(preset)
         if not p:
-            logger.warning(f"[T2VClient] 未知档位 {preset}，回退 standard")
-            p = self.presets.get("standard") or self.presets[list(self.presets)[0]]
+            p = self.presets.get("standard") or list(self.presets.values())[0]
 
         final_w = width if width is not None else int(p.get("width", self.default_width))
         final_h = height if height is not None else int(p.get("height", self.default_height))
@@ -152,10 +161,7 @@ class ComfyUITextToVideoClient:
         final_steps = steps if steps is not None else p.get("steps")
         final_cfg = cfg if cfg is not None else p.get("cfg")
 
-        logger.info(
-            f"[T2VClient] submit preset={preset} "
-            f"{final_w}x{final_h}x{final_l} steps={final_steps} cfg={final_cfg}"
-        )
+        logger.info(f"[T2VClient] submit preset={preset} {final_w}x{final_h}x{final_l}")
 
         workflow = copy.deepcopy(self._load_workflow())
 
@@ -189,7 +195,6 @@ class ComfyUITextToVideoClient:
             for sid in save_ids:
                 if "filename_prefix" in workflow[sid].get("inputs", {}):
                     workflow[sid]["inputs"]["filename_prefix"] = prefix
-
         except KeyError as e:
             raise TextToVideoException(f"工作流参数注入失败: {e}")
 
@@ -219,7 +224,6 @@ class ComfyUITextToVideoClient:
                 logger.warning(f"[T2VClient] poll error: {e}")
                 time.sleep(self.poll_interval)
                 continue
-
             if r.status_code == 200:
                 history = r.json()
                 if prompt_id in history:
@@ -234,7 +238,6 @@ class ComfyUITextToVideoClient:
                             if items:
                                 return items[0]
             time.sleep(self.poll_interval)
-
         raise TextToVideoException(f"文生视频超时 (>{self.poll_timeout}s)")
 
     def download_output(self, info: dict) -> bytes:
@@ -243,12 +246,9 @@ class ComfyUITextToVideoClient:
         ftype = info.get("type", "output")
         if not filename:
             raise TextToVideoException(f"输出信息缺 filename: {info}")
-
         url = (
             f"{self.base_url}/view"
-            f"?filename={filename}"
-            f"&subfolder={subfolder}"
-            f"&type={ftype}"
+            f"?filename={filename}&subfolder={subfolder}&type={ftype}"
         )
         r = requests.get(url, timeout=300)
         if r.status_code != 200:

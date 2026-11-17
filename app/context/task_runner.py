@@ -124,6 +124,8 @@ class TaskRunner:
             return "video"
         if "image" in types:
             return "image"
+        if "audio" in types:      # ⭐ 新增：音频类型
+            return "audio"
         if "card" in types:
             return "card"
         if len(parts) > 1:

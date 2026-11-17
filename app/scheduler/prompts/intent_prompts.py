@@ -44,7 +44,7 @@ GENERAL_PROMPT = """你在 general 领域内判断具体意图。可选意图：
 ## params 输出
 按 intent 对应参数：
 - translation: {"text": "...", "target_lang": "英文|日文|..."}
-- tts: {"text": "...", "voice": ""}
+- tts: {"text": "...", "voices": ""}
 - code_generation: {"requirement": "...", "language": ""}
 
 ## 输出格式（严格 JSON）
@@ -82,13 +82,14 @@ CONTENT_PROMPT = """你在 content 领域内判断具体意图。可选意图：
 - 单步骤 → false
 
 ## params 输出
-- document_qa: {"file_id": "...", "question": "..."}
-- document_summarize: {"file_id": "...", "user_query": "..."}
-- ppt_generation: {"content": "..."}
-- word_generation: {"content": "..."}
-- knowledge_query: {"question": "..."}
-- mindmap: {"topic": "..."}
-- prototype: {"requirement": "..."}
+⚠️ **不要输出 file_id 字段**，系统会自动从用户附件注入。
+- document_qa: {"question": "用户的问题"}
+- document_summarize: {"user_query": "概括要求"}
+- ppt_generation: {"content": "生成 PPT 的内容"}
+- word_generation: {"content": "生成 Word 的内容"}
+- knowledge_query: {"question": "查询的问题"}
+- mindmap: {"topic": "思维导图主题"}
+- prototype: {"requirement": "产品需求"}
 
 ## 输出格式（严格 JSON）
 {"intent": "document_qa|document_summarize|ppt_generation|word_generation|knowledge_query|mindmap|prototype|OUT_OF_DOMAIN", "confidence": 0.0-1.0, "needs_agent": false, "reasoning": "一句话", "params": {}}
@@ -102,18 +103,11 @@ IMAGE_PROMPT = """你在 image 领域内判断具体意图。可选意图：
 - image_understanding: 有图片附件，识别/描述/OCR/解题/这是什么
 
 ## 判断规则
-1. 有图 + "去掉/加上/变成/改成/换风格/美化/去水印/更暗/更亮" → image_edit
+1. 有图 + "去掉/加上/变成/改成/换风格/美化/去水印/更暗/更亮/编辑/修图" → image_edit
 2. 有图 + "这是什么/描述/识别/提取文字/OCR/解题/翻译图片" → image_understanding
 3. 无图 + "画一张/画一个/生成图片/画只/画个" → image_generation
-4. 以上都不匹配 → 输出 OUT_OF_DOMAIN
-
-## needs_agent 判断
-本领域所有意图都是单工具流程，永远 false。
-
-## params 输出
-- image_generation: {"prompt": "...", "width": null, "height": null}
-- image_edit: {"prompt": "...", "image_file_id": ""}
-- image_understanding: {"question": "..."}
+4. **有图 + "动/动起来/说话/对口型/配音/让它说" → 输出 OUT_OF_DOMAIN** ⭐ 交给 video 领域
+5. 以上都不匹配 → 输出 OUT_OF_DOMAIN
 
 ## 输出格式（严格 JSON）
 {"intent": "image_generation|image_edit|image_understanding|OUT_OF_DOMAIN", "confidence": 0.0-1.0, "needs_agent": false, "reasoning": "一句话", "params": {}}

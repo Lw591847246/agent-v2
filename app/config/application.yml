@@ -6,7 +6,14 @@
 server:
   host: 0.0.0.0
   port: 9000
-  workers: 1
+  workers: 1          # ⚠️ 必须为 1，GlobalGPULock 是进程级锁
+
+# ==========================================
+# GPU 资源池锁（新增）
+# ==========================================
+gpu:
+  purge_on_start: true       # 启动清场（清掉上次进程残留显存）
+  purge_on_shutdown: true    # 关闭清场（可选，建议 true）
 
 # ==========================================
 # 服务注册 & 第三方工作流集成
@@ -90,43 +97,30 @@ services:
         cfg: 7.5
 
   tts:
-    # TTS 卸载端点（按你实际引擎填）
-    # CosyVoice2 正确端点可能是 /api/unload、/v1/unload，或根本不存在
-    # 留空则用默认候选（会自动尝试 9010/9011 的 /unload、/api/unload、/v1/unload）
+    # TTS 上游卸载端点（多个 URL 会依次尝试）
+    # 你的 CosyVoice2 / IndexTTS2 如果有 /unload、/api/unload 之类的端点，填进来
+    # 留空 [] 则自动探测（/unload /api/unload /v1/unload /release /free）
     unload_urls: []
-    # 如果所有 URL 都失败，是否启用 taskkill 兜底
-    # ⚠️ 会 kill 占用显存 > 1000MB 的非自身进程，请确认安全后再开
+    # 所有 URL 都失败时是否 taskkill 兜底
+    # ⚠️ 本代码仅在 gpu_unloaders.py 里打印告警，不会主动 kill 进程
     taskkill_enabled: false
 
   search:
-    # 留空 = 用 realtime_rules.py 的默认值
-    # 想自定义则填完整列表
     realtime_keywords: []
     realtime_patterns: []
-    max_results: 3       # 搜索条数（3 条足够，多了慢）
-    max_chars: 800       # 注入 LLM 的最大字符数（800 字约 3-4 秒生成）
-    fetcher:                  # ⭐ 新增
+    max_results: 3
+    max_chars: 800
+    fetcher:
       enabled: true
-      max_urls: 3             # 最多抓几个 URL 的正文
-      max_chars_per_url: 2000 # 每个 URL 最多保留多少字
-      timeout: 8              # 单 URL 抓取超时（秒）
-      max_concurrent: 3       # 并发抓取数
-      cache_ttl: 3600         # 缓存时间（秒）
-      circuit_threshold: 5    # 连续失败几次触发熔断
-      circuit_cooldown: 300   # 熔断后冷却多少秒
-      relevance_prefilter: true    # ⭐ 新增：正文相关性预筛
+      max_urls: 3
+      max_chars_per_url: 2000
+      timeout: 8
+      max_concurrent: 3
+      cache_ttl: 3600
+      circuit_threshold: 5
+      circuit_cooldown: 300
+      relevance_prefilter: true
 
-    # 自定义示例（取消注释并填写）：
-    # realtime_keywords:
-    #   - "今天"
-    #   - "最新"
-    #   - "我家附近"       # 加新场景不用改代码
-    #   - "跌到多少"
-    # realtime_patterns:
-    #   - "今天.*新闻"
-    #   - ".*我家附近.*"
-
-  # 自托管 SearXNG（可选）
   searxng:
     base_url: ""
 
@@ -135,25 +129,34 @@ services:
 # Ollama 模型服务与 GPU 调度策略
 # ==========================================
 ollama:
-  # 统一基础 URL
-  base_url: "http://localhost:11434/api/chat"
+  # ⭐ 必须是不带路径的 host！
+  # 原值 "http://localhost:11434/api/chat" 会让 unload_ollama 拼成
+  # ".../api/chat/api/generate" 而 404
+  # 新 unload_ollama 已加 _strip_api_path 兜底，但推荐直接改成纯 host
+  base_url: "http://localhost:11434"
 
-  # 任务模型映射
   models:
-    intent: "qwen2.5:7b"                         # ← L1/L2 主路由（新增/替换）
-    intent_large: "qwen2.5:14b-instruct-q4_K_M"  # ← 难例兜底（新增）
-    chat: "qwen2.5:7b"    # 主聊天及文档生成
-    reasoning: deepseek-r1:14b           # 深度推理（备用）
-    code: deepseek-coder-v2:16b          # 代码生成
-    vision: qwen2.5vl:7b                 # 视觉理解
-    ocr: qwen2.5vl:7b             # OCR 提取
-    embedding: bge-m3:latest             # RAG 向量化
+    intent: "qwen2.5:7b"
+    intent_large: "qwen2.5:14b-instruct-q4_K_M"
+    chat: "qwen2.5:7b"
+    reasoning: deepseek-r1:14b
+    code: deepseek-coder-v2:16b
+    vision: qwen2.5vl:7b
+    ocr: qwen2.5vl:7b
+    embedding: bge-m3:latest
 
-  # ⭐ 显存常驻策略：-1 表示常驻内存，0 表示用完立刻卸载腾出显存
+  # ⭐ 显存常驻策略
+  # 说明：
+  #   "-1"  → 永不卸载（4.7G 一直占着）
+  #   "0"   → 用完立刻卸载
+  #   "30m" → 空闲 30 分钟后卸载
+  # GPU 锁会在切换到其他资源（ComfyUI / TTS / LP）时主动对 ALL 模型发 keep_alive=0，
+  # 所以 "intent: -1" 的常驻在切换时也会被强制卸载——
+  # 建议改成 "30m"，避免每次切走再切回都重加载 7B（加载 3-5 秒）。
   keep_alive:
-    intent: "-1"        # 7B 常驻（4.7GB，8GB 卡可装）
-    intent_large: "0"  # 14B 用完即释放
-    chat: "5m"     # ⭐ 改为 -1m
+    intent: "30m"          # 从 "-1" 改为 "30m"
+    intent_large: "0"
+    chat: "30m"            # 与 intent 同模型时共驻留
     reasoning: "0"
     code: "0"
     vision: "0"
@@ -162,6 +165,7 @@ ollama:
 
   default_num_ctx: 16384
   default_temperature: 0.6
+
 
 # ==========================================
 # 数据库与中间件
@@ -222,6 +226,7 @@ vector_store:
   chunk_overlap: 50
   top_k: 5
 
+
 # ==========================================
 # Agent 编排配置
 # ==========================================
@@ -239,42 +244,38 @@ agent:
     summary_model_key: chat
     summary_timeout_sec: 120
 
-# 文档生成与长文本处理配置
 doc_processing:
-  # 模型单次最大上下文 Token（本地 qwen2.5:14b 建议设为 8192，未来云端可设为 32000）
   max_context_tokens: 8192
-  # 预留给 System Prompt 和生成内容的 Token（大概预留 2000）
   reserved_tokens: 2500
-  # 中文 1 个字大约 1.5 个 Token，用于估算
   chars_per_token: 1.5
-  # 单次分块的最大字数（防止一次喂给模型的内容太长）
   chunk_size_chars: 4000
 
-# 在文件末尾追加
 storyboard:
-  mode: single          # ⭐ single（单图运镜，8G 友好） / multi（多图拼接，需 24G+）
+  mode: single
   image_width: 720
   image_height: 1080
   zoom_max: 1.15
   fps: 30
   output_width: 720
   output_height: 1280
-  max_scenes: 6         # multi 模式最多 6 个场景
+  max_scenes: 6
 
-# 在文件末尾追加
+
+# ==========================================
+# TTS 配置
+# ==========================================
 tts:
-  # ⭐ 切换引擎只需改这里：indextts2 / cosyvoice2
+  # ⭐ 切换引擎只需改这里
   engine: cosyvoice2
 
-  # 公共参考音频（两个引擎共用）
   default_ref_audio: "./data/voices/anime_narrator.wav"
 
-  # CosyVoice2 配置
   cosyvoice2:
     base_url: "http://127.0.0.1:9011"
+    # ⚠️ 6000 秒 = 100 分钟，如果你 TTS 真的会跑这么久就保留；
+    # 否则建议改 300（5 分钟），避免一次卡死把 sem 占 100 分钟
     timeout: 6000
 
-  # IndexTTS2 配置（保留，随时可切回）
   indextts2:
     base_url: "http://127.0.0.1:9010"
     timeout: 6000

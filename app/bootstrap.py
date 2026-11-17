@@ -1,5 +1,7 @@
 # app/bootstrap.py
 """启动装配 + Skill 自检。"""
+from typing import Optional
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -12,8 +14,13 @@ from app.middleware.request_id import RequestIdMiddleware
 from app.infrastructure.repositories.mysql_pool import mysql_pool
 
 
-def create_app() -> FastAPI:
-    app = FastAPI(title=app_settings.name, version=app_settings.version)
+def create_app(lifespan=None) -> FastAPI:
+    # ⭐ 唯一改动：把 lifespan 透传给 FastAPI
+    app = FastAPI(
+        title=app_settings.name,
+        version=app_settings.version,
+        lifespan=lifespan,
+    )
 
     app.add_middleware(
         CORSMiddleware,

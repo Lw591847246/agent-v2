@@ -1,7 +1,7 @@
 # app/infrastructure/clients/model_manager.py
 import requests
 from app.config.loader import config
-from app.infrastructure.clients.gpu_lock import gpu_lock
+from app.core.gpu_lock import gpu_lock
 from app.core.logger import logger
 from typing import List, Dict
 

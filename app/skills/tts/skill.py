@@ -24,7 +24,7 @@ class TtsSkill(BaseSkill):
         "type": "object",
         "properties": {
             "text": {"type": "string", "description": "要合成的文本"},
-            "voice": {"type": "string", "description": "音色，可空，用默认音色"},
+            "voices": {"type": "string", "description": "音色，可空，用默认音色"},
         },
         "required": ["text"],
     }
@@ -72,7 +72,7 @@ class TtsSkill(BaseSkill):
             skill_name="tts",
             session_id=session_id,
             user_id=user_id,
-            slots={"text": text[:200], "voice": voice, "length": len(text)},
+            slots={"text": text[:200], "voices": voice, "length": len(text)},
             fn=lambda tid: self._run_async(tid, text, voice, session_id),
         )
         card = card_part(

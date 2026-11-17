@@ -17,6 +17,7 @@ from app.application.conversation_service import conversation_service
 from app.application.file_upload_service import file_upload_service
 from app.contracts.result import Result
 from app.core.logger import logger
+from app.core.trace_context import set_trace_context, get_trace_id   # ✅ 新增
 from app.middleware.auth import auth_interceptor
 
 router = APIRouter(tags=["文件"])
@@ -42,6 +43,10 @@ async def process_file_with_prompt(
     if not session_id or not session_id.strip():
         session_id = conversation_service.new_conversation(user_id)
     conversation_service.ensure_conversation(session_id, user_id)
+
+    # ✅ 请求线程里设上下文，并拿住 trace_id（后续跨线程要恢复）
+    set_trace_context(session_id=session_id, user_id=user_id)
+    trace_id = get_trace_id()
 
     # 保存文件
     attachments = []
@@ -81,6 +86,8 @@ async def process_file_with_prompt(
     # 流式
     if hr.is_stream:
         def gen_stream():
+            # ✅ StreamingResponse 在另一个 AnyIO 线程执行，恢复上下文
+            set_trace_context(trace_id=trace_id, session_id=session_id, user_id=user_id)
             full_text = ""
             try:
                 for chunk in hr.result.iterator:
@@ -105,6 +112,8 @@ async def process_file_with_prompt(
     msg_id = chat_service.finalize(hr, parts=parts, outputs=outputs)
 
     def gen_final():
+        # ✅ 同样恢复上下文
+        set_trace_context(trace_id=trace_id, session_id=session_id, user_id=user_id)
         for part in parts:
             yield _sse({"type": "chunk", "part": part})
         yield _sse({"type": "done", "message_id": msg_id, "duration_ms": duration_ms})

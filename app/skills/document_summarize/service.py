@@ -85,18 +85,33 @@ class DocumentSummarizeService:
 
     @staticmethod
     def _read_doc(file_id: str) -> str:
-        meta = file_registry.get(file_id) if file_id else None
-        if not meta:
+        if not file_id:
+            logger.warning("[DocumentSummarize] file_id 为空")
             return ""
+        meta = file_registry.get(file_id)
+        if not meta:
+            logger.warning(f"[DocumentSummarize] file_registry 中找不到 file_id={file_id}")
+            return ""
+        logger.info(f"[DocumentSummarize] file_registry 命中: meta={meta}")
+
         path = meta.get("path")
         name = meta.get("name", "doc")
-        if not path or not os.path.isfile(path):
+        if not path:
+            logger.warning(f"[DocumentSummarize] meta 中没有 path 字段")
             return ""
+        if not os.path.isfile(path):
+            logger.warning(f"[DocumentSummarize] 本地文件不存在: {path}")
+            return ""
+
         try:
             with open(path, "rb") as f:
-                return extract_text_from_file(f.read(), name)
+                content = f.read()
+            logger.info(f"[DocumentSummarize] 文件读取成功: {path}, size={len(content)} bytes")
+            text = extract_text_from_file(content, name)
+            logger.info(f"[DocumentSummarize] 解析完成: name={name}, 文本长度={len(text)}")
+            return text
         except Exception as e:
-            logger.error(f"[DocumentSummarize] 读取失败: {e}")
+            logger.error(f"[DocumentSummarize] 读取或解析 {name} 失败: {e}", exc_info=True)
             return ""
 
 
