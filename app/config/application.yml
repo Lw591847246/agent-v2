@@ -16,6 +16,16 @@ gpu:
   purge_on_shutdown: true    # 关闭清场（可选，建议 true）
 
 # ==========================================
+# health（启动探活）
+# ==========================================
+health:
+  fail_fast: true                # true=Ollama 不通则阻断启动；false=仅告警
+  probe_timeout: 5               # 单次探活超时
+  check_ollama: true             # Ollama 核心，建议 true
+  check_comfyui: false           # 图/视频链路存在再开
+
+
+# ==========================================
 # 服务注册 & 第三方工作流集成
 # ==========================================
 services:
@@ -30,6 +40,13 @@ services:
     text_2_image_path: app/config/workflows/Qwen_Image_2.1_GGUF_Text2Image.json
     image_2_image_path: app/config/workflows/Qwen_Image_2.1_GGUF_Image2Image_Edit.json
     read_timeout: 600
+    poll_interval: 3             # 轮询间隔
+    poll_timeout: 600            # 轮询总时长上限
+    timeout:
+      connect: 8                 # 建连：进程没起/端口不通秒级失败
+      submit: 30                 # /prompt 提交、/upload 上传 单次 read
+      query: 10                  # /history 单次 read
+      download: 60               # /view 下载 read
   face_swap:
     base_url: http://127.0.0.1:8188
     workflow_path: app/config/workflows/face_swap.json
@@ -135,6 +152,23 @@ ollama:
   # 新 unload_ollama 已加 _strip_api_path 兜底，但推荐直接改成纯 host
   base_url: "http://localhost:11434"
 
+  # 可选：多机分片时按 service 覆盖源；未覆盖的自动回落 base_url
+  # 单机部署时整段可不写，行为与现在一致
+  hosts:
+    # intent:    "http://gpu-a:11434"
+    # chat:      "http://gpu-a:11434"
+    # reasoning: "http://gpu-a:11434"
+    # vision:    "http://gpu-b:11434"
+    # ocr:       "http://gpu-b:11434"
+    # embedding: "http://gpu-b:11434"
+
+  # 分层超时（秒）
+  timeout:
+    connect: 8        # 建连：源没起 / 端口不通时秒级失败，不再空等 read
+    read_chat: 180    # 非流式：等完整响应
+    read_stream: 120  # 流式：相邻块间隔，同时充当首 token 超时
+    unload: 3         # keep_alive=0 卸载请求的超时
+
   models:
     intent: "qwen2.5:7b"
     intent_large: "qwen2.5:14b-instruct-q4_K_M"
@@ -203,6 +237,9 @@ rate_limit:
   default_qps: 10
   chat_qps: 5
   upload_qps: 2
+  retention_seconds: 300         # key 闲置多久可回收（须 > 1s 窗口）
+  sweep_interval: 60             # 两次清扫最小间隔
+  max_keys: 50000                # key 总量硬上限，逼近即强制清扫
 
 file:
   max_file_tokens: 4096

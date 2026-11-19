@@ -1,3 +1,12 @@
+# app/infrastructure/clients/qwen_Image_client.py
+'''
+Qwen-Image (ComfyUI) 客户端 -- 超时配置化 + 分层超时(connect/read)改造版
+
+相对原版唯一变化：所有网络超时不再写死，统一从 yml 读取并按 connect/read 分层；
+轮询总时长上限与轮询间隔从写死(1200/2)改为配置驱动；超时单独抛
+QwenImageTimeoutException(QwenImageException 子类)，便于全局 handler 映射错误码。
+业务逻辑(工作流注入、尺寸安全、上传、轮询判定)原样保留。
+'''
 import os
 import json
 import copy
@@ -5,14 +14,19 @@ import time
 import base64
 import requests
 import logging
-from typing import Optional, Tuple   # ⭐ 必须补上，否则 Optional 未定义
+from typing import Optional, Tuple   # 必须补上，否则 Optional 未定义
 
 from app.config.loader import config
-from app.core.logger import logger   # ⭐ 关键：用项目的统一 logger
+from app.core.logger import logger   # 用项目的统一 logger
 
 
 class QwenImageException(Exception):
     """自定义异常，您也可以替换成项目里统一的异常类"""
+    pass
+
+
+class QwenImageTimeoutException(QwenImageException):
+    """生成/轮询/网络超时专用异常(仍属 QwenImageException，不破坏现有 except 分支)"""
     pass
 
 
@@ -25,17 +39,37 @@ class QwenImageClient:
         self.text_2_image_path = config.get("services.qwen_image.text_2_image_path")
         self.img_2_img_path = config.get("services.qwen_image.image_2_image_path")
 
+        # 超时统一配置化(分层 connect/read)，缺省回落到与历史写死值等价的默认
+        _t = config.get("services.qwen_image.timeout", {}) or {}
+        # 建连超时：进程没起/端口不通时秒级失败，不再空等 read 全时长
+        self.connect_timeout = _t.get("connect", config.get("services.qwen_image.connect_timeout", 8))
+        # 单次请求 read 超时(按用途分桶)
+        self.submit_timeout = _t.get("submit", config.get("services.qwen_image.submit_timeout", 30))
+        self.query_timeout = _t.get("query", config.get("services.qwen_image.query_timeout", 10))
+        self.download_timeout = _t.get("download", config.get("services.qwen_image.download_timeout", 60))
+        # 轮询：间隔 + 总时长上限(总时长缺省回落到旧键 read_timeout，再兜底 600)
+        self.poll_interval = config.get("services.qwen_image.poll_interval", 3)
+        self.poll_timeout = config.get(
+            "services.qwen_image.poll_timeout",
+            config.get("services.qwen_image.read_timeout", 600),
+        )
+
         # 优雅地预加载两个工作流模板
         self.workflow_template = self._load_workflow(self.text_2_image_path)
         self.img2img_workflow_template = self._load_workflow(self.img_2_img_path)
 
+    def _conn_read(self, read: float) -> tuple:
+        """构造 requests 的分层超时元组：(connect, read)。
+        建连阶段用 connect(秒级失败)，等待响应用 read。"""
+        return (self.connect_timeout, read)
+
     def _load_workflow(self, workflow_path: str) -> dict | None:
         """公共方法：加载工作流 JSON 文件"""
         if not workflow_path:
-            logger.info(f"[Qwen-Image] 工作流路径未配置")
+            logger.info("[Qwen-Image] 工作流路径未配置")
             return None
 
-        # ★ 相对路径基于项目根解析（避免 cwd 不对）
+        # 相对路径基于项目根解析(避免 cwd 不对)
         if not os.path.isabs(workflow_path):
             from pathlib import Path
             project_root = Path(__file__).resolve().parent.parent.parent.parent
@@ -57,17 +91,17 @@ class QwenImageClient:
         if not self.workflow_template:
             raise QwenImageException("ComfyUI 工作流模板未加载")
 
-        # ⭐ None → 默认值
+        # None -> 默认值
         if width is None:
             width = 768
         if height is None:
             height = 1024
 
         workflow = copy.deepcopy(self.workflow_template)
-        # 尺寸安全限制（8G 显存保护）
+        # 尺寸安全限制(8G 显存保护)
         width, height = self._clamp_size(width, height)
 
-        # ⭐ 小尺寸警告（Qwen 在 <384 时效果会明显下降）
+        # 小尺寸警告(Qwen 在 <384 时效果会明显下降)
         if min(width, height) < 384:
             logger.warning(f"【文生图】尺寸 {width}x{height} 偏小，Qwen 效果可能不佳")
 
@@ -88,7 +122,7 @@ class QwenImageClient:
         return self._submit_and_poll(workflow, prompt, mode="文生图")
 
 
-    # 新增：上传图片到 ComfyUI
+    # 上传图片到 ComfyUI
     def upload_image(self, image_bytes: bytes, filename: str = None) -> str:
         """上传图片到 ComfyUI，自动识别真实格式"""
         # 动态检测真实图片格式
@@ -103,7 +137,7 @@ class QwenImageClient:
         elif image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
             actual_ext, mime_type = "webp", "image/webp"
         else:
-            raise QwenImageException(f"无法识别的图片格式")
+            raise QwenImageException("无法识别的图片格式")
 
         # 生成唯一文件名
         if not filename:
@@ -116,13 +150,18 @@ class QwenImageClient:
         url = f"{self.base_url.rstrip('/')}/upload/image"
         files = {'image': (filename, image_bytes, mime_type)}
         data = {'type': 'input', 'overwrite': 'true'}
-        resp = requests.post(url, files=files, data=data, timeout=30)
+        try:
+            resp = requests.post(url, files=files, data=data, timeout=self._conn_read(self.submit_timeout))
+        except requests.exceptions.Timeout as e:
+            raise QwenImageTimeoutException(f"图片上传超时: {e}")
+        except requests.exceptions.ConnectionError:
+            raise QwenImageException("ComfyUI 服务未启动")
         if resp.status_code != 200:
             raise QwenImageException(f"图片上传失败: {resp.text}")
 
         return resp.json().get("name")
 
-    # 新增：图生图方法
+    # 图生图方法
     def generate_img2img(self, prompt: str, image_bytes: bytes, width=None, height=None, denoise=1.0):
         if not self.img2img_workflow_template:
             raise QwenImageException("图生图工作流模板未加载")
@@ -172,17 +211,17 @@ class QwenImageClient:
         except KeyError as e:
             raise QwenImageException(f"图生图节点 ID 匹配失败: {e}")
 
-        # ⭐ 唯一保留的 INFO 日志：一行概览
-        logger.info(f"【图生图】原图{orig_w}x{orig_h}→{new_w}x{new_h}, denoise={denoise}, prompt={prompt[:30]}...")
+        # 唯一保留的 INFO 日志：一行概览
+        logger.info(f"【图生图】原图{orig_w}x{orig_h}->{new_w}x{new_h}, denoise={denoise}, prompt={prompt[:30]}...")
         return self._submit_and_poll(workflow, prompt, mode="图生图")
 
     def _clamp_size(self, width: int, height: int) -> Tuple[int, int]:
         """尺寸安全限制，保护 8G 显存"""
         MAX_SIDE = 1024
         MAX_PIXELS = 768 * 1024
-        MIN_SIDE = 256  # ⭐ Qwen-Image 2.1 最低支持 256
+        MIN_SIDE = 256  # Qwen-Image 2.1 最低支持 256
 
-        # ⭐ 最小值保护
+        # 最小值保护
         width = max(width, MIN_SIDE)
         height = max(height, MIN_SIDE)
 
@@ -202,26 +241,32 @@ class QwenImageClient:
         return (max(width // 8, 8) * 8, max(height // 8, 8) * 8)
 
 
-    # 将原来的提交和轮询逻辑提取成公共方法
+    # 提交和轮询逻辑(公共方法)
     def _submit_and_poll(self, workflow: dict, prompt: str, mode: str = "图生图") -> dict:
         try:
             client_id = str(time.time())
             resp = requests.post(
-                f"{self.base_url}/prompt",
+                f"{self.base_url.rstrip('/')}/prompt",
                 json={"prompt": workflow, "client_id": client_id},
-                timeout=30,
+                timeout=self._conn_read(self.submit_timeout),
             )
             if resp.status_code != 200:
                 raise QwenImageException(f"ComfyUI 接收任务失败: {resp.text}")
             prompt_id = resp.json()["prompt_id"]
+        except requests.exceptions.Timeout as e:
+            raise QwenImageTimeoutException(f"提交任务超时: {e}")
         except requests.exceptions.ConnectionError:
             raise QwenImageException("ComfyUI 服务未启动")
 
         logger.info(f"【{mode}】任务已提交, ID={prompt_id}")
         start_time = time.time()
-        while time.time() - start_time < 1200:
+        # 总时长上限从写死 1200 改为配置驱动
+        while time.time() - start_time < self.poll_timeout:
             try:
-                history_resp = requests.get(f"{self.base_url}/history/{prompt_id}", timeout=10)
+                history_resp = requests.get(
+                    f"{self.base_url.rstrip('/')}/history/{prompt_id}",
+                    timeout=self._conn_read(self.query_timeout),
+                )
                 if history_resp.status_code == 200:
                     history = history_resp.json()
                     if prompt_id in history:
@@ -232,24 +277,25 @@ class QwenImageClient:
                                 filename = img_info["filename"]
                                 subfolder = img_info.get("subfolder", "")
                                 img_type = img_info.get("type", "output")
-                                img_url = f"{self.base_url}/view?filename={filename}&subfolder={subfolder}&type={img_type}"
-                                img_resp = requests.get(img_url, timeout=30)
+                                img_url = f"{self.base_url.rstrip('/')}/view?filename={filename}&subfolder={subfolder}&type={img_type}"
+                                img_resp = requests.get(img_url, timeout=self._conn_read(self.download_timeout))
                                 if img_resp.status_code == 200:
                                     img_base64 = base64.b64encode(img_resp.content).decode("utf-8")
                                     elapsed = time.time() - start_time
                                     logger.info(
-                                        f"【{mode}】✅ 完成, 耗时={elapsed:.1f}s, 图片={len(img_resp.content) / 1024:.0f}KB"
+                                        f"【{mode}】完成, 耗时={elapsed:.1f}s, 图片={len(img_resp.content) / 1024:.0f}KB"
                                     )
                                     return {
                                         "type": "image",
                                         "image_base64": img_base64,
                                         "prompt": prompt,
                                     }
-            except Exception:
-                pass
-            time.sleep(2)
+            except requests.exceptions.RequestException as e:
+                # 单次查询/下载的网络抖动：记录后继续轮询，由总时长上限兜底
+                logger.debug(f"【{mode}】轮询一次异常(继续重试): {e}")
+            time.sleep(self.poll_interval)
 
-        raise QwenImageException("生成超时 (超过 20 分钟)")
+        raise QwenImageTimeoutException(f"生成超时 (超过 {int(self.poll_timeout)} 秒)")
 
 # 单例模式暴露
 qwen_image_client = QwenImageClient()

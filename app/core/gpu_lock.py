@@ -157,11 +157,15 @@ class GlobalGPULock:
             "switch_count": 0,
             "unload_total_ms": 0,
         }
+        self._ollama_reachable: bool = True
 
     # ---------- 观测 ----------
 
     def current(self) -> GPUResource:
         return self._current
+
+    def mark_ollama_unreachable(self):
+        self._ollama_reachable = False
 
     def stats(self) -> Dict:
         with self._waiting_lock:
@@ -377,6 +381,12 @@ class GlobalGPULock:
                   GPUResource.INDEXTTS2, GPUResource.COSYVOICE2,
                   GPUResource.LIVEPORTRAIT, GPUResource.MUSETALK):
             if r in exclude:
+                continue
+            # 复用启动探活结论：探活已判 Ollama 不通时跳过其卸载段，
+            # 避免对已知死地址逐个模型空等(每个 3~4s，累计约 24s)。
+            # 仅跳过 Ollama，ComfyUI/TTS/Musetalk/LivePortrait 不受影响。
+            if r.value.startswith("ollama_") and not self._ollama_reachable:
+                logger.debug("[GPU调度] 启动探活已判 Ollama 不通，跳过 Ollama 卸载")
                 continue
             try:
                 freed = self._unload(r)
