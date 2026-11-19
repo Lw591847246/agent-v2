@@ -1,37 +1,94 @@
-"""异步任务统一入口：create / progress / finish / fail / outputs 落库。"""
+"""异步任务统一入口：create / progress / finish / fail / outputs 落库。
+
+V2 加固：
+- BoundedSemaphore 并发闸：物理掐断内存/DB 连接池/GPU 排队峰值
+- submit 非阻塞：闸满直接拒绝，不拖住 web 线程
+- trace_id / session_id / user_id 显式透传：threading.Thread 不继承 contextvar
+"""
 from __future__ import annotations
 
 import json
+import os
 import threading
 import uuid
 from typing import Callable, Optional
 
+from app.core.context import RequestContext
 from app.core.logger import logger
 from app.infrastructure.repositories.conversation_repo import conversation_repo
 from app.infrastructure.repositories.task_repo import task_repo
 
 
 class TaskRunner:
+    def __init__(self, max_concurrent: Optional[int] = None):
+        # 默认 3，可用环境变量 TASK_MAX_CONCURRENT 调（按内存调整）
+        n = max_concurrent or int(os.getenv("TASK_MAX_CONCURRENT", "3"))
+        n = max(1, n)
+        self._max_concurrent = n
+        # BoundedSemaphore：误多 release 会抛 ValueError，防止闸被悄悄放大
+        self._sem = threading.BoundedSemaphore(n)
+        self._running = 0
+        self._running_lock = threading.Lock()
+
     def submit(
         self, skill_name: str, session_id: str, user_id: int,
         slots: dict, fn: Callable[[str], None],
         provider: str = "local",
     ) -> str:
-        task_id = f"{skill_name}_{uuid.uuid4().hex[:10]}"
-        task_repo.create_task(
-            task_id=task_id, session_id=session_id, user_id=user_id,
-            skill_name=skill_name, slots=slots or {}, provider=provider,
+        # 非阻塞抢闸：满了直接拒绝，绝不在 web 线程里 acquire 阻塞
+        if not self._sem.acquire(blocking=False):
+            logger.warning(
+                f"[TaskRunner] 并发已达上限({self._max_concurrent})，拒绝入队 "
+                f"skill={skill_name} session={session_id}"
+            )
+            raise RuntimeError("系统繁忙，后台任务已达并发上限，请稍后重试")
+
+        # 抢到闸后，下面任何一步失败都要把闸放回去，否则信号量漏放会越跑越小
+        try:
+            task_id = f"{skill_name}_{uuid.uuid4().hex[:10]}"
+            task_repo.create_task(
+                task_id=task_id, session_id=session_id, user_id=user_id,
+                skill_name=skill_name, slots=slots or {}, provider=provider,
+            )
+        except Exception:
+            self._sem.release()
+            raise
+
+        # threading.Thread 不继承 contextvar：主线程先取出来，传进子线程再 set
+        trace_id = RequestContext.get_trace_id()
+        threading.Thread(
+            target=self._run,
+            args=(task_id, fn, trace_id, session_id, str(user_id)),
+            daemon=True,
+        ).start()
+
+        with self._running_lock:
+            self._running += 1
+            cur = self._running
+        logger.info(
+            f"[TaskRunner] submitted task_id={task_id} skill={skill_name} running={cur}"
         )
-        threading.Thread(target=self._run, args=(task_id, fn), daemon=True).start()
-        logger.info(f"[TaskRunner] submitted task_id={task_id} skill={skill_name}")
         return task_id
 
-    def _run(self, task_id: str, fn: Callable[[str], None]) -> None:
+    def _run(
+        self, task_id: str, fn: Callable[[str], None],
+        trace_id: str, session_id: str, user_id: str,
+    ) -> None:
+        # 子线程入口重建请求上下文，使后台任务日志也能带上 trace_id
+        RequestContext.set_trace_id(trace_id)
+        RequestContext.set_session_id(session_id)
+        RequestContext.set_user_id(user_id)
+        RequestContext.set_extra_fields(task_type=task_id.split("_", 1)[0])
         try:
             fn(task_id)
         except Exception as e:
             logger.error(f"[TaskRunner] task_id={task_id} 执行失败: {e}", exc_info=True)
             self.fail(task_id, str(e))
+        finally:
+            with self._running_lock:
+                self._running -= 1
+            self._sem.release()
+            RequestContext.clear_extra_fields()
 
     def progress(self, task_id: str, pct: int, msg: Optional[str] = None, steps: Optional[list] = None) -> None:
         try:
@@ -49,7 +106,6 @@ class TaskRunner:
         session_id: Optional[str] = None,
         message_extra: Optional[dict] = None,
     ) -> None:
-        # ⭐ 1. 先更新会话消息（把图片/视频路径、输出等写入 agent_message）
         if not session_id:
             info = task_repo.get(task_id)
             session_id = info.session_id if info else None
@@ -76,7 +132,6 @@ class TaskRunner:
         else:
             logger.warning(f"[TaskRunner] finish 找不到 session_id task_id={task_id}")
 
-        # ⭐ 2. 最后更新任务表状态（前端轮询拿到 done 时，消息表已确保更新完毕）
         try:
             task_repo.finish(
                 task_id, parts=parts, duration_ms=duration_ms,
@@ -101,7 +156,7 @@ class TaskRunner:
         try:
             msg_id = conversation_repo.get_message_id_by_task_id(session_id, task_id)
             if msg_id:
-                parts = [{"type": "text", "content": f"❌ 任务失败：{error}"}]
+                parts = [{"type": "text", "content": f"任务失败：{error}"}]
                 conversation_repo.update_message_content(
                     message_id=msg_id,
                     content=json.dumps(parts, ensure_ascii=False),
@@ -124,7 +179,7 @@ class TaskRunner:
             return "video"
         if "image" in types:
             return "image"
-        if "audio" in types:      # ⭐ 新增：音频类型
+        if "audio" in types:
             return "audio"
         if "card" in types:
             return "card"

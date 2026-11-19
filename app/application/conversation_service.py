@@ -1,9 +1,11 @@
 """会话服务。"""
+import os
 import re
 import threading
 import uuid
 from typing import Any, Dict, List, Optional
 import contextvars
+import concurrent.futures
 
 from app.core.exceptions import NotFoundException
 from app.core.gpu_lock import GPUResource, gpu_lock
@@ -15,6 +17,61 @@ from app.utils.content_parser import parse_content_for_llm
 from app.core.llm_tracker import track_llm
 
 _summary_locks: Dict[str, threading.Lock] = {}
+
+# ============================================================
+# 有界后台执行器：收编原先的两处裸线程（标题优化 / 摘要生成）
+#   - worker 数固定，活跃后台线程恒定不超过 _BG_MAX_WORKERS；
+#   - 提交侧信号量限排队，超额 best-effort 丢弃（标题有本地规则兜底、
+#     摘要下一轮会补，丢弃无副作用）；
+#   - 避免每个请求裸起 daemon 线程抽干 DB 连接池与 Ollama。
+# ============================================================
+_BG_MAX_WORKERS = int(os.getenv("CONV_BG_MAX_WORKERS", "2"))
+_BG_QUEUE_CAP = int(os.getenv("CONV_BG_QUEUE_CAP", "16"))
+
+_bg_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_BG_MAX_WORKERS,
+    thread_name_prefix="conv-bg",
+)
+# 容量 = 同时在跑的 worker + 允许排队的任务数
+_bg_sem = threading.BoundedSemaphore(_BG_MAX_WORKERS + _BG_QUEUE_CAP)
+
+
+def submit_bg(task_label: str, fn, *args) -> bool:
+    """把 best-effort 后台任务提交到有界执行器。
+
+    返回是否成功提交；闸满立即返回 False，不阻塞调用方（Web 线程）。
+    通过 contextvars.copy_context 把 trace_id 等上下文透传进 worker 线程。
+    """
+    if not _bg_sem.acquire(blocking=False):
+        logger.warning(
+            f"[后台任务] 并发/队列已满，丢弃 best-effort 任务 label={task_label}"
+        )
+        return False
+
+    def _runner():
+        try:
+            fn(*args)
+        finally:
+            _bg_sem.release()
+
+    ctx = contextvars.copy_context()
+    try:
+        _bg_executor.submit(ctx.run, _runner)
+    except Exception:
+        # submit 失败（如执行器已关闭）必须归还信号量，避免漏放
+        _bg_sem.release()
+        logger.warning(f"关闭期丢弃")
+        return  False
+    return True
+
+
+def shutdown_conversation_background(wait: bool = False) -> None:
+    """供应用 lifespan 关闭阶段调用，优雅收尾后台任务。"""
+    try:
+        _bg_executor.shutdown(wait=wait)
+    except Exception as e:
+        logger.warning(f"[后台任务] 关闭执行器异常: {e}")
+
 
 _SUMMARY_PROMPT_TMPL = """你是对话历史摘要助手。请将以下对话压缩成简洁摘要。
 
@@ -115,11 +172,9 @@ class ConversationService:
         self._repo.update_title(session_id, title)
         logger.info(f"【标题】本地规则生成: {title}")
 
-        ctx = contextvars.copy_context()
-        threading.Thread(
-            target=ctx.run, args=(self._async_optimize_title, session_id, text),
-            daemon=True,
-        ).start()
+        # 原裸线程 -> 有界后台执行器：标题优化 best-effort，闸满直接丢弃，
+        # 本地规则标题已先落库，丢弃不影响用户可见结果。
+        submit_bg("title-opt", self._async_optimize_title, session_id, text)
 
     def _async_optimize_title(self, session_id: str, text: str):
         try:
@@ -127,7 +182,7 @@ class ConversationService:
                 f"请为以下对话生成一个不超过 12 个字的简短标题，"
                 f"只输出标题文字，不要标点、不要引号、不要解释：\n\n{text}"
             )
-            # ⭐ 标题优化是独立后台线程，独立抢锁；短任务超时 60s
+            # 标题优化是后台任务，独立抢锁；短任务超时 60s
             with gpu_lock.lease(GPUResource.OLLAMA_CHAT, task="title-opt", timeout=60):
                 result = ollama_client.chat(
                     service="intent", model_key="intent",
@@ -276,6 +331,7 @@ class ConversationService:
             self._do_generate_summary(session_id)
             return
 
+        # per-session 锁：同一会话已有摘要在跑就直接跳过（保留原语义）。
         lock = _summary_locks.setdefault(session_id, threading.Lock())
         if not lock.acquire(blocking=False):
             return
@@ -286,7 +342,16 @@ class ConversationService:
             finally:
                 lock.release()
 
-        threading.Thread(target=_run, daemon=True, name=f"sum-{session_id[:8]}").start()
+        # 原裸线程 -> 有界后台执行器。
+        # 关键：per-session 锁在提交前已持有，若提交失败（闸满/执行器关闭）
+        # 必须在此处释放，否则该 session 的锁永久泄漏、后续摘要全被卡死。
+        try:
+            submitted = submit_bg("summary", _run)
+        except Exception:
+            lock.release()
+            raise
+        if not submitted:
+            lock.release()
 
     def _do_generate_summary(self, session_id: str) -> None:
         from app.config.loader import config
@@ -337,7 +402,7 @@ class ConversationService:
         )
 
         try:
-            # ⭐ 摘要是后台线程的长 LLM 调用，独立抢锁；超时 180s
+            # 摘要是后台长 LLM 调用，独立抢锁；超时 180s
             with gpu_lock.lease(GPUResource.OLLAMA_CHAT, task="summary", timeout=180):
                 result = ollama_client.chat(
                     service=svc, model_key=mkey,

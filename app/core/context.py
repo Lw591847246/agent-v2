@@ -26,3 +26,14 @@ class RequestContext:
 
     @staticmethod
     def get_session_id() -> str: return _session_id.get() or ""
+
+    # ---- 结构化日志附加字段（task_type / duration_ms 等），桥接到 logger ----
+    @staticmethod
+    def set_extra_fields(**kwargs):
+        from app.core.logger import set_extra_fields
+        set_extra_fields(**kwargs)
+
+    @staticmethod
+    def clear_extra_fields():
+        from app.core.logger import clear_extra_fields
+        clear_extra_fields()

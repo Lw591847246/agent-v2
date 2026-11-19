@@ -1,5 +1,5 @@
 # app/infrastructure/repositories/task_repo.py
-"""统一任务仓储（V2）：finish 支持 outputs。"""
+"""统一任务仓储（V2）：finish 支持 outputs；新增启动期僵尸任务回收。"""
 from __future__ import annotations
 
 import json
@@ -166,6 +166,37 @@ class TaskRepo:
                 cur.execute(sql, (session_id, limit))
                 rows = cur.fetchall()
         return [_row_to_info(r) for r in rows]
+
+    # ---------- 僵尸任务回收（启动钩子调用）----------
+    def mark_timeout_running_as_failed(self, timeout_minutes: int = 120) -> int:
+        """把创建时间超过 timeout_minutes 仍处于 pending/running 的任务标记为 failed。
+
+        用途：进程被 OOM Killer 杀掉后重启，DB 里会残留永远卡在 running 的僵尸任务。
+        在 main.py lifespan 启动时调用一次即可。
+
+        安全点：
+        - 只清"创建时间早于 NOW()-timeout_minutes"的记录，绝不误杀刚启动的正常任务；
+        - timeout_minutes 要大于系统里最长的正常任务耗时（默认 120，你的 INDEXTTS2 约 100min）；
+        - 多 worker 部署下不能用进程启动时间做基准，这里用 created_at 超时窗口相对安全，
+          但仍建议配合 workers=1 使用。
+        """
+        sql = """
+            UPDATE agent_video_task
+            SET status='failed',
+                error='进程重启导致任务中断（超时未完成，启动时自动回收）',
+                finished_at=NOW()
+            WHERE status IN ('pending', 'running')
+              AND created_at < NOW() - INTERVAL %s MINUTE
+        """
+        with _conn() as c:
+            with c.cursor() as cur:
+                n = cur.execute(sql, (timeout_minutes,))
+            c.commit()
+        if n:
+            logger.warning(f"[TaskRepo] 启动回收僵尸任务 {n} 条（timeout={timeout_minutes}min）")
+        else:
+            logger.info("[TaskRepo] 启动回收：无僵尸任务需要清理")
+        return n
 
 
 def _row_to_info(row: dict) -> TaskInfo:

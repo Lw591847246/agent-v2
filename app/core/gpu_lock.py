@@ -7,6 +7,10 @@
 - LeaseTicket：可跨线程释放（流式响应场景）
 - 切换资源前强制卸载旧资源，并校验显存实际下降
 - purge_all / stats：启动清场 + 观测
+
+修复：_map_task_name 未知任务不再默认按 COMFYUI 处理（原逻辑会误卸载
+正在被 Ollama 占用的显存去给没用的 ComfyUI 腾地方），改为显式抛错，
+让上层明确拒绝，避免无谓的显存/内存抖动与重新加载延迟。
 """
 from __future__ import annotations
 
@@ -86,11 +90,14 @@ def _map_task_name(task_name: str) -> GPUResource:
     if "liveportrait" in name or "anchor" in name or "portrait" in name:
         return GPUResource.LIVEPORTRAIT
 
-    logger.warning(f"[GPU锁] 未知 task_name='{task_name}'，默认按 COMFYUI 处理")
-    return GPUResource.COMFYUI
+    # 修复：未知 task_name 不再默认按 COMFYUI 处理。
+    # 原兜底会让 Ollama 正在用的显存被错误卸载去给没用的 ComfyUI 腾地方，
+    # 造成无谓的显存/内存抖动与模型重新加载延迟。改为显式抛错，让上层拒绝执行。
+    logger.error(f"[GPU锁] 未知 task_name='{task_name}'，拒绝执行以防误卸载在用资源")
+    raise ValueError(f"未知 GPU 任务类型: {task_name}")
 
 
-# ⭐ 嵌套识别：sync / async 共用，嵌套标记随协程/线程作用域自动传播
+# 嵌套识别：sync / async 共用，嵌套标记随协程/线程作用域自动传播
 _root_ticket: ContextVar[Optional["LeaseTicket"]] = ContextVar(
     "gpu_lock_root_ticket", default=None
 )
@@ -198,7 +205,7 @@ class GlobalGPULock:
         if timeout is None:
             timeout = DEFAULT_TIMEOUTS.get(resource, 300)
 
-        # 1) 同协程/线程嵌套 → 复用外层租约
+        # 1) 同协程/线程嵌套 -> 复用外层租约
         parent = _root_ticket.get()
         if parent is not None and not parent.released:
             if parent.resource != resource:
@@ -246,7 +253,6 @@ class GlobalGPULock:
             raise
 
         ticket = LeaseTicket(self, resource, task, is_root=True, wait_ms=wait_ms)
-        # ⭐ 写入 contextvar，同时保存 token 以便 release 时还原
         ticket._ctx_token = _root_ticket.set(ticket)
 
         with self._stats_lock:
@@ -265,7 +271,7 @@ class GlobalGPULock:
                 log_gpu(f"复用 {resource.value}")
                 return
 
-            logger.info(f"【GPU调度】切换资源: {old.value} → {resource.value}")
+            logger.info(f"【GPU调度】切换资源: {old.value} -> {resource.value}")
             log_gpu(f"切换前 {old.value}")
             t0 = time.time()
             freed = self._unload(old)
@@ -285,7 +291,7 @@ class GlobalGPULock:
             )
             if old != GPUResource.NONE and freed < 100:
                 logger.warning(
-                    f"【GPU调度】⚠️ 卸载 {old.value} 仅释放 {freed}MB，"
+                    f"【GPU调度】卸载 {old.value} 仅释放 {freed}MB，"
                     f"可能未真正卸载（检查 unloader 配置）"
                 )
 
@@ -307,7 +313,6 @@ class GlobalGPULock:
     def _on_release(self, ticket: LeaseTicket):
         if not ticket.is_root:
             return
-        # 还原 ContextVar
         try:
             if ticket._ctx_token is not None:
                 _root_ticket.reset(ticket._ctx_token)
@@ -348,14 +353,12 @@ class GlobalGPULock:
                           task: str = "default",
                           timeout: Optional[float] = None,
                           task_name: Optional[str] = None):
-        # acquire 是阻塞操作，丢线程池执行 → 事件循环不被卡住
         ticket = await asyncio.to_thread(
             self.acquire, resource, task, timeout, task_name,
         )
         try:
             yield ticket
         finally:
-            # release 内部是快速的（sem.release + log），直接同步调即可
             ticket.release()
 
     # ---------- 启动/关闭清场 ----------
