@@ -108,22 +108,26 @@ class ChatService:
         outputs: Optional[List[dict]] = None,
         full_text: str = "",
     ) -> int:
-        """落库 assistant 消息 + 触发 orchestrator。返回 msg_id。"""
         duration_ms = hr.ctx.params.get("_duration_ms", 0)
-        token_stats = token_recorder.pop_trace_stats(get_trace_id())
         msg_id = 0
         try:
-            content = full_text if full_text else self._parts_to_content(parts)
-            message_type = self._infer_type(parts)
+            # ⭐ 检测是否是失败 result，统一替换成标准失败格式
+            if self._is_failure(parts):
+                failure_parts = self._build_failure_parts(parts)
+                content = json.dumps(failure_parts, ensure_ascii=False)
+                message_type = "multi"
+                outputs = []
+                logger.info(f"[ChatService] 检测到失败，归一化落库")
+            else:
+                content = full_text if full_text else self._parts_to_content(parts)
+                message_type = self._infer_type(parts)
+
             msg_id = conversation_service.save_assistant_message(
                 session_id=hr.session_id,
                 content=content,
                 message_type=message_type,
                 outputs=outputs,
                 duration_ms=duration_ms,
-                input_tokens=token_stats["input_tokens"],
-                output_tokens=token_stats["output_tokens"],
-                total_cost=token_stats["cost"],
             )
             logger.info(f"[ChatService] 落库 msg_id={msg_id} type={message_type}")
         except Exception as e:
@@ -131,8 +135,7 @@ class ChatService:
 
         try:
             conversation_orchestrator.after_turn(
-                hr.ctx,
-                hr.decision,
+                hr.ctx, hr.decision,
                 hr.decision.skill.name if hr.decision and hr.decision.skill else "",
             )
         except Exception as e:

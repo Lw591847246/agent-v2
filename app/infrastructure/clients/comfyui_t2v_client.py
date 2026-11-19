@@ -64,6 +64,14 @@ class ComfyUITextToVideoClient:
         self.default_height = int(base.get("default_height", 360))
         self.default_length = int(base.get("default_length", 48))
 
+        # ⭐ 分层超时：connect 秒级失败、read 维持原值；均可在 application.yml 覆盖
+        self.connect_timeout = float(base.get("connect_timeout", 5))
+        self.submit_timeout = float(base.get("submit_timeout", 30))
+        self.poll_read_timeout = float(base.get("poll_read_timeout", 15))
+        self.download_connect_timeout = float(base.get("download_connect_timeout", 10))
+        self.download_read_timeout = float(base.get("download_read_timeout", 300))
+        # ⭐ 轮询连续连接/读失败达到该次数即提前判定任务失败，不再空转到 poll_timeout
+        self.poll_max_connect_failures = int(base.get("poll_max_connect_failures", 5))
         self.nodes: dict = base.get("nodes", {}) or {}
 
         presets = base.get("presets", {}) or {}
@@ -203,7 +211,7 @@ class ComfyUITextToVideoClient:
             r = requests.post(
                 f"{self.base_url}/prompt",
                 json={"prompt": workflow, "client_id": client_id},
-                timeout=30,
+                timeout=(self.connect_timeout, self.submit_timeout),
             )
         except requests.exceptions.ConnectionError as e:
             raise TextToVideoException(f"ComfyUI 连接失败: {e}")
@@ -217,28 +225,38 @@ class ComfyUITextToVideoClient:
 
     def wait_for(self, prompt_id: str) -> dict:
         deadline = time.time() + self.poll_timeout
+        # ⭐ 连续(连接/读)失败计数：每收到一次 HTTP 响应(含非 200)即清零；
+        #    连续达到 poll_max_connect_failures 次 -> 判定 ComfyUI 已挂，提前抛错，
+        #    不再像旧逻辑吞掉异常 sleep 重试，一路空转到 poll_timeout(默认 3600s)。
+        consec_fail = 0
+        max_fail = max(1, self.poll_max_connect_failures)
         while time.time() < deadline:
             try:
-                r = requests.get(f"{self.base_url}/history/{prompt_id}", timeout=15)
+                r = requests.get(f"{self.base_url}/history/{prompt_id}",
+                                 timeout=(self.connect_timeout, self.poll_read_timeout))
+                consec_fail = 0  # 收到响应 = 服务仍存活，清零
+                if r.status_code == 200:
+                    history = r.json()
+                    if prompt_id in history:
+                        entry = history[prompt_id]
+                        status = entry.get("status", {})
+                        if status.get("status_str") == "error":
+                            raise TextToVideoException(f"执行错误: {entry}")
+                        for _node_id, node_out in entry.get("outputs", {}).items():
+                            for key in ("videos", "gifs", "images"):
+                                items = node_out.get(key) or []
+                                if items:
+                                    return items[0]
+            except TextToVideoException:
+                raise
             except Exception as e:
-                logger.warning(f"[T2VClient] poll error: {e}")
-                time.sleep(self.poll_interval)
-                continue
-            if r.status_code == 200:
-                history = r.json()
-                if prompt_id in history:
-                    entry = history[prompt_id]
-                    status = entry.get("status", {})
-                    if status.get("status_str") == "error":
-                        raise TextToVideoException(f"ComfyUI 执行错误: {entry}")
-                    outputs = entry.get("outputs", {})
-                    for _node_id, node_out in outputs.items():
-                        for key in ("videos", "gifs", "images"):
-                            items = node_out.get(key) or []
-                            if items:
-                                return items[0]
+                consec_fail += 1
+                logger.warning(f"[T2VClient] poll error {consec_fail}/{max_fail}: {e}")
+                if consec_fail >= max_fail:
+                    raise TextToVideoException(
+                        f"ComfyUI 连续 {consec_fail} 次轮询失败，提前判定任务失败: {e}")
             time.sleep(self.poll_interval)
-        raise TextToVideoException(f"文生视频超时 (>{self.poll_timeout}s)")
+        raise TextToVideoException(f"轮询超时 (>{self.poll_timeout}s)")
 
     def download_output(self, info: dict) -> bytes:
         filename = info.get("filename")
@@ -250,7 +268,7 @@ class ComfyUITextToVideoClient:
             f"{self.base_url}/view"
             f"?filename={filename}&subfolder={subfolder}&type={ftype}"
         )
-        r = requests.get(url, timeout=300)
+        r = requests.get(url, timeout=(self.download_connect_timeout, self.download_read_timeout))
         if r.status_code != 200:
             raise TextToVideoException(f"下载失败 {r.status_code}")
         return r.content

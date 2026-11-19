@@ -45,6 +45,15 @@ class ComfyUIImageToVideoClient:
         self.fps = int(base.get("fps", 16))
         self.max_length = int(base.get("max_length", 97))
         self.default_length = int(base.get("default_length", 49))
+        # ⭐ 分层超时：connect 秒级失败、read 维持原值；均可在 application.yml 覆盖
+        self.connect_timeout = float(base.get("connect_timeout", 5))
+        self.upload_timeout = float(base.get("upload_timeout", 60))
+        self.submit_timeout = float(base.get("submit_timeout", 30))
+        self.poll_read_timeout = float(base.get("poll_read_timeout", 15))
+        self.download_connect_timeout = float(base.get("download_connect_timeout", 10))
+        self.download_read_timeout = float(base.get("download_read_timeout", 300))
+        # ⭐ 轮询连续连接/读失败达到该次数即提前判定任务失败，不再空转到 poll_timeout
+        self.poll_max_connect_failures = int(base.get("poll_max_connect_failures", 5))
         self.nodes = base.get("nodes", {}) or {}
         self.presets = base.get("presets", {}) or {}
         self._template: Optional[dict] = None
@@ -107,7 +116,8 @@ class ComfyUIImageToVideoClient:
         url = f"{self.base_url}/upload/image"
         files = {"image": (filename, image_bytes, mime)}
         data = {"type": "input", "overwrite": "true"}
-        r = requests.post(url, files=files, data=data, timeout=60)
+        r = requests.post(url, files=files, data=data,
+                     timeout=(self.connect_timeout, self.upload_timeout))
         if r.status_code != 200:
             raise ImageToVideoException(f"图片上传失败: {r.text[:200]}")
         name = r.json().get("name")
@@ -198,7 +208,7 @@ class ComfyUIImageToVideoClient:
         r = requests.post(
             f"{self.base_url}/prompt",
             json={"prompt": workflow, "client_id": client_id},
-            timeout=30,
+            timeout=(self.connect_timeout, self.submit_timeout),
         )
         logger.info(f"[I2VClient] 提交接口返回, HTTP状态码={r.status_code}")
         if r.status_code != 200:
@@ -213,9 +223,16 @@ class ComfyUIImageToVideoClient:
 
     def wait_for(self, prompt_id: str) -> dict:
         deadline = time.time() + self.poll_timeout
+        # ⭐ 连续(连接/读)失败计数：每收到一次 HTTP 响应(含非 200)即清零；
+        #    连续达到 poll_max_connect_failures 次 -> 判定 ComfyUI 已挂，提前抛错，
+        #    不再像旧逻辑吞掉异常 sleep 重试，一路空转到 poll_timeout(默认 3600s)。
+        consec_fail = 0
+        max_fail = max(1, self.poll_max_connect_failures)
         while time.time() < deadline:
             try:
-                r = requests.get(f"{self.base_url}/history/{prompt_id}", timeout=15)
+                r = requests.get(f"{self.base_url}/history/{prompt_id}",
+                                 timeout=(self.connect_timeout, self.poll_read_timeout))
+                consec_fail = 0  # 收到响应 = 服务仍存活，清零
                 if r.status_code == 200:
                     history = r.json()
                     if prompt_id in history:
@@ -223,17 +240,22 @@ class ComfyUIImageToVideoClient:
                         status = entry.get("status", {})
                         if status.get("status_str") == "error":
                             raise ImageToVideoException(f"执行错误: {entry}")
-                        for _nid, out in entry.get("outputs", {}).items():
+                        for _node_id, node_out in entry.get("outputs", {}).items():
                             for key in ("videos", "gifs", "images"):
-                                items = out.get(key) or []
+                                items = node_out.get(key) or []
                                 if items:
                                     return items[0]
             except ImageToVideoException:
                 raise
             except Exception as e:
-                logger.warning(f"[I2VClient] poll error: {e}")
+                consec_fail += 1
+                logger.warning(f"[I2VClient] poll error {consec_fail}/{max_fail}: {e}")
+                if consec_fail >= max_fail:
+                    raise ImageToVideoException(
+                        f"ComfyUI 连续 {consec_fail} 次轮询失败，提前判定任务失败: {e}")
             time.sleep(self.poll_interval)
-        raise ImageToVideoException(f"超时 (>{self.poll_timeout}s)")
+        raise ImageToVideoException(f"轮询超时 (>{self.poll_timeout}s)")
+
 
     def download_output(self, info: dict) -> bytes:
         filename = info.get("filename")
@@ -243,7 +265,7 @@ class ComfyUIImageToVideoClient:
             raise ImageToVideoException(f"缺 filename: {info}")
         url = (f"{self.base_url}/view?filename={filename}"
                f"&subfolder={subfolder}&type={ftype}")
-        r = requests.get(url, timeout=300)
+        r = requests.get(url, timeout=(self.download_connect_timeout, self.download_read_timeout))
         if r.status_code != 200:
             raise ImageToVideoException(f"下载失败 {r.status_code}")
         return r.content

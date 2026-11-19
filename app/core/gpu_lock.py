@@ -61,6 +61,15 @@ DEFAULT_TIMEOUTS: Dict[GPUResource, float] = {
 }
 
 
+# 轻量后台任务：如消息摘要(summary)，本身耗时极短，却常被并行的长任务
+# (文生图/文生视频/图生视频，单次持锁可达数百秒)在锁队列里饿死——
+# 它们在 acquire 上排了队却因"锁等待超时"阈值过短(历史 180s)先一步超时失败。
+# 解法(本批方案)：为这类任务单独上调"锁等待超时"，取 max(上游传入值, 配置值)，
+# 让它能排过长任务继续等锁；这类任务超时并非致命，失败日志降为 WARNING 降噪。
+LIGHTWEIGHT_BACKGROUND_TASKS = {"summary", "summarize", "摘要", "context_summary"}
+DEFAULT_LIGHTWEIGHT_WAIT_TIMEOUT = 900.0   # 秒；覆盖一条完整视频任务的排队时长
+
+
 def _map_task_name(task_name: str) -> GPUResource:
     name = (task_name or "").lower()
 
@@ -209,6 +218,22 @@ class GlobalGPULock:
         if timeout is None:
             timeout = DEFAULT_TIMEOUTS.get(resource, 300)
 
+        # 轻量后台任务(summary 等)：单独上调锁等待超时，取 max(上游值, 配置值)，
+        # 避免被长任务(文生图/视频)的持锁排队饿死；超时非致命，日志降噪。
+        _tk = (task if task and task != "default" else (task_name or "") or "").strip().lower()
+        is_lightweight = _tk in LIGHTWEIGHT_BACKGROUND_TASKS
+        if is_lightweight:
+            from app.config.loader import config as _cfg
+            lw_wait = float(_cfg.get("gpu.lightweight_wait_timeout",
+                                      DEFAULT_LIGHTWEIGHT_WAIT_TIMEOUT))
+            new_timeout = max(timeout or 0.0, lw_wait)
+            if new_timeout != timeout:
+                logger.info(
+                    f"【GPU调度】轻量后台任务 [{task}] 锁等待超时由 {timeout}s "
+                    f"上调至 {new_timeout}s（让位于长任务排队，避免被饿死）"
+                )
+            timeout = new_timeout
+
         # 1) 同协程/线程嵌套 -> 复用外层租约
         parent = _root_ticket.get()
         if parent is not None and not parent.released:
@@ -241,7 +266,13 @@ class GlobalGPULock:
                 pass
 
         if not acquired:
-            logger.error(f"【GPU调度】任务 [{task}] 等待超时 {timeout}s")
+            if is_lightweight:
+                logger.warning(
+                    f"【GPU调度】轻量后台任务 [{task}] 等待超时 {timeout}s（非关键，"
+                    f"本轮摘要等增值能力降级，不影响主任务）"
+                )
+            else:
+                logger.error(f"【GPU调度】任务 [{task}] 等待超时 {timeout}s")
             raise TimeoutError(
                 f"GPU 资源繁忙，任务 [{task}] 获取执行权超时 {timeout}s"
             )

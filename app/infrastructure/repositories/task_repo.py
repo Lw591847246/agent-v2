@@ -1,5 +1,14 @@
-# app/infrastructure/repositories/task_repo.py
-"""统一任务仓储（V2）：finish 支持 outputs；新增启动期僵尸任务回收。"""
+"""app/infrastructure/repositories/task_repo.py
+统一任务仓储（V2）：finish 支持 outputs；新增启动期僵尸任务回收。
+
+本批改动（定点）：fail() 写端收口节点状态。
+- 旧行为：fail() 只写 status/error/finished_at，不碰 steps_json，任务进终态后
+  最后一个 update_progress 写入的 running 节点被冻结在"转圈"态，前端出现
+  「红色失败横幅 + 死掉的那个节点还在转圈」的反直觉画面。
+- 新行为：fail() 在写终态的同一次更新里，读出现有 steps_json，把其中
+  status=="running" 的节点改写为 "failed"（done 保持、未跑到的 pending 保持），
+  一并写回。所有走 fail() 的业务（文生图/图生视频/…）自动复用同一套收口逻辑。
+"""
 from __future__ import annotations
 
 import json
@@ -10,6 +19,7 @@ from typing import Any, Optional
 from app.core.logger import logger
 from app.domain.models.task import TaskInfo
 from app.infrastructure.repositories.mysql_pool import mysql_pool
+from app.application.failure_message_service import friendly_error
 
 
 @contextmanager
@@ -19,6 +29,25 @@ def _conn():
         yield conn
     finally:
         conn.close()
+
+
+def _reconcile_steps_for_fail(steps: list) -> tuple[list, bool]:
+    """任务进终态时对 steps 的收口（纯函数，便于离线单测）。
+
+    规则：
+    - running -> failed  （真正死在执行中的那个节点）
+    - done    -> 保持不变（确实跑完的前置节点）
+    - pending -> 保持不变（压根没轮到的节点，前端画灰）
+    返回 (新 steps, 是否发生改写)。非 dict 元素原样保留、不改写。
+    """
+    changed = False
+    new_steps = []
+    for s in steps:
+        if isinstance(s, dict) and s.get("status") == "running":
+            s = {**s, "status": "failed"}
+            changed = True
+        new_steps.append(s)
+    return new_steps, changed
 
 
 class TaskRepo:
@@ -116,12 +145,76 @@ class TaskRepo:
             fields["outputs_json"] = json.dumps(outputs, ensure_ascii=False)
         self.update(task_id, **fields)
 
+        # ---------- fail（核心修复：节点收口 + 友好文案） ----------
+
     def fail(self, task_id: str, error: str) -> None:
-        self.update(
-            task_id,
-            status="failed", error=error,
-            finished_at=datetime.now().isoformat(timespec="seconds"),
-        )
+        """
+        统一失败写入口。所有业务调 task_repo.fail() 自动获得：
+          1. 节点态收口：steps 中 running -> failed，done/pending 不动；
+          2. error 字段存友好短句（原始异常仅进日志，不存 DB）。
+
+        注意：调用方传入的 error 参数应为原始异常字符串（方便日志排查），
+              本方法内部会调用 friendly_error() 转为友好文案后写入 DB。
+              原始异常全文由调用方自行 logger.exception() 记录。
+        """
+        # 1. 友好文案（写 DB）
+        display_error = friendly_error(error)
+
+        # 2. 读取当前 steps 并收口
+        fields: dict[str, Any] = {
+            "status": "failed",
+            "error": display_error,
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        try:
+            info = self.get(task_id)
+            if info and info.steps_json:
+                steps = json.loads(info.steps_json)
+                if isinstance(steps, list):
+                    has_change = False
+                    for s in steps:
+                        if isinstance(s, dict) and s.get("status") == "running":
+                            s["status"] = "failed"
+                            has_change = True
+                    if has_change:
+                        fields["steps_json"] = json.dumps(steps, ensure_ascii=False)
+        except Exception:
+            pass  # 收口失败不影响主流程
+
+        self.update(task_id, **fields)
+
+    # def fail(self, task_id: str, error: str) -> None:
+    #     """失败终态写入口：同步收口 steps 节点状态。
+    #
+    #     写 status=failed / error / finished_at 的同时，读出现有 steps_json，
+    #     把其中正在 running 的节点改写为 failed（done 保持、pending 保持），
+    #     在同一次更新内写回。这样任务进终态后，前端不会再看到「失败横幅 +
+    #     死掉的那个节点还在转圈」的错位画面。
+    #     解析 steps_json 失败 / 无 steps / 没有 running 节点时，只落终态、
+    #     不写 steps_json，不影响 fail 主流程。
+    #     """
+    #     fields = {
+    #         "status": "failed",
+    #         "error": error,
+    #         "finished_at": datetime.now().isoformat(timespec="seconds"),
+    #     }
+    #     try:
+    #         info = self.get(task_id)
+    #         if info is not None and getattr(info, "steps_json", None):
+    #             steps = json.loads(info.steps_json)
+    #             if isinstance(steps, list):
+    #                 new_steps, changed = _reconcile_steps_for_fail(steps)
+    #                 if changed:
+    #                     fields["steps_json"] = new_steps
+    #                     logger.info(
+    #                         "[TaskRepo] fail 收口节点态 task_id=%s steps=%s"
+    #                         % (task_id, [s.get("status") for s in new_steps if isinstance(s, dict)])
+    #                     )
+    #     except Exception as e:
+    #         logger.warning(
+    #             "[TaskRepo] fail 收口 steps 跳过（不影响失败落库）task_id=%s err=%s" % (task_id, e)
+    #         )
+    #     self.update(task_id, **fields)
 
     # ---------- read ----------
     def get_progress(self, task_id: str) -> Optional[dict]:

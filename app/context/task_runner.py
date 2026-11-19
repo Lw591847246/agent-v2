@@ -151,17 +151,46 @@ class TaskRunner:
             info = task_repo.get(task_id)
             session_id = info.session_id if info else None
         if not session_id:
+            logger.warning(f"[TaskRunner] fail 找不到 session_id task_id={task_id}")
             return
 
         try:
             msg_id = conversation_repo.get_message_id_by_task_id(session_id, task_id)
-            if msg_id:
-                parts = [{"type": "text", "content": f"任务失败：{error}"}]
-                conversation_repo.update_message_content(
-                    message_id=msg_id,
-                    content=json.dumps(parts, ensure_ascii=False),
-                    outputs=[],
-                )
+            if not msg_id:
+                logger.warning(f"[TaskRunner] fail 找不到 msg_id task_id={task_id}")
+                return
+
+            # ⭐ 统一失败格式：error 卡片 + 兜底 text
+            error_full = error or "未知错误"
+            error_short = error_full[:500]
+
+            parts = [
+                {
+                    "type": "card",
+                    "card_type": "error",
+                    "status": "failed",
+                    "data": {
+                        "title": "任务执行失败",
+                        "description": error_short,
+                        "error": error_short,
+                    },
+                },
+                {
+                    "type": "text",
+                    "content": f"❌ 任务失败：{error_short}",
+                },
+            ]
+
+            conversation_repo.update_message_content(
+                message_id=msg_id,
+                content=json.dumps(parts, ensure_ascii=False),
+                outputs=[],
+                message_type="multi",
+            )
+            logger.info(
+                f"[TaskRunner] fail 已更新消息 msg_id={msg_id} "
+                f"task_id={task_id} error_len={len(error_full)}"
+            )
         except Exception as e:
             logger.warning(f"[TaskRunner] fail update_message failed: {e}")
 

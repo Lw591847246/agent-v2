@@ -53,6 +53,11 @@ class QwenImageClient:
             "services.qwen_image.poll_timeout",
             config.get("services.qwen_image.read_timeout", 600),
         )
+        # 连续轮询失败提前退出阈值：连续 N 次 connect/read 失败即判死，
+        # 不再吞异常空转到 poll_timeout（对齐 i2v/t2v 的 poll_max_connect_failures）
+        self.poll_max_connect_failures = int(
+            config.get("services.qwen_image.poll_max_connect_failures", 5)
+        )
 
         # 优雅地预加载两个工作流模板
         self.workflow_template = self._load_workflow(self.text_2_image_path)
@@ -260,6 +265,9 @@ class QwenImageClient:
 
         logger.info(f"【{mode}】任务已提交, ID={prompt_id}")
         start_time = time.time()
+        # 连续失败计数：收到一次 HTTP 响应即清零；连续达阈值提前判死
+        consec_fail = 0
+        max_fail = self.poll_max_connect_failures
         # 总时长上限从写死 1200 改为配置驱动
         while time.time() - start_time < self.poll_timeout:
             try:
@@ -267,6 +275,9 @@ class QwenImageClient:
                     f"{self.base_url.rstrip('/')}/history/{prompt_id}",
                     timeout=self._conn_read(self.query_timeout),
                 )
+                # 只要拿到 HTTP 响应(含非 200)就视为服务存活，清零连续失败计数，
+                # 避免误杀偶发一次抖动的正常长任务
+                consec_fail = 0
                 if history_resp.status_code == 200:
                     history = history_resp.json()
                     if prompt_id in history:
@@ -291,8 +302,15 @@ class QwenImageClient:
                                         "prompt": prompt,
                                     }
             except requests.exceptions.RequestException as e:
-                # 单次查询/下载的网络抖动：记录后继续轮询，由总时长上限兜底
-                logger.debug(f"【{mode}】轮询一次异常(继续重试): {e}")
+                # 查询/下载异常：累加连续失败计数；连续达阈值提前判死，不再空转到 poll_timeout
+                consec_fail += 1
+                logger.warning(
+                    f"【{mode}】轮询异常 poll error {consec_fail}/{max_fail}: {e}"
+                )
+                if consec_fail >= max_fail:
+                    raise QwenImageException(
+                        f"ComfyUI 连续 {max_fail} 次轮询失败，提前判定任务失败: {e}"
+                    )
             time.sleep(self.poll_interval)
 
         raise QwenImageTimeoutException(f"生成超时 (超过 {int(self.poll_timeout)} 秒)")

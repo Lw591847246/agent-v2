@@ -89,7 +89,9 @@ class ImageToVideoSkill(BaseSkill):
         desc = f"画质:{final_preset} · 时长:{final_duration}s"
         if final_speech:
             desc += " · 含配音"
-
+            speech_step = {"label": "合成语音", "status": "pending"}
+        else:
+            speech_step = {"label": "合成语音（无配音）", "status": "done"}
         card = card_part(
             "skill_progress",
             {
@@ -100,7 +102,7 @@ class ImageToVideoSkill(BaseSkill):
                 "steps": [
                     {"label": "解析素材", "status": "done"},
                     {"label": "生成画面", "status": "running"},
-                    {"label": "合成语音", "status": "pending" if final_speech else "done"},
+                    speech_step,
                 ],
             },
             status="processing",

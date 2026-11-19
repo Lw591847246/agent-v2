@@ -22,20 +22,30 @@ class LivePortraitClient:
     def __init__(self, base_url: Optional[str] = None, timeout: Optional[int] = None) -> None:
         self.base_url = (base_url or config.base_url).rstrip("/")
         self.timeout = timeout or config.timeout_seconds
+        # ⭐ 分层超时：httpx 用 httpx.Timeout 把 connect 单独收紧到秒级，read 维持原值；
+        #    值优先从 liveportrait 配置读，缺省兜底，向后兼容不依赖 config 必须新增字段。
+        self.connect_timeout = float(getattr(config, "connect_timeout", 5))
+        self.upload_connect_timeout = float(getattr(config, "upload_connect_timeout", 5))
+        self.download_connect_timeout = float(getattr(config, "download_connect_timeout", 10))
 
     # ---------- low level ----------
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
 
+    def _timeout(self, read: float, connect: Optional[float] = None) -> httpx.Timeout:
+        """read 维持原值，connect 单独收紧；缺省用 self.connect_timeout。"""
+        c = self.connect_timeout if connect is None else connect
+        return httpx.Timeout(timeout=float(read), connect=float(c))
+
     def _get_json(self, path: str) -> Any:
-        with httpx.Client(timeout=self.timeout) as c:
+        with httpx.Client(timeout=self._timeout(self.timeout)) as c:
             r = c.get(self._url(path))
         if r.status_code >= 400:
             raise LivePortraitError(f"GET {path} -> {r.status_code}: {r.text[:300]}")
         return r.json()
 
     def _post_json(self, path: str, body: dict) -> Any:
-        with httpx.Client(timeout=self.timeout) as c:
+        with httpx.Client(timeout=self._timeout(self.timeout)) as c:
             r = c.post(self._url(path), json=body)
         if r.status_code >= 400:
             raise LivePortraitError(f"POST {path} -> {r.status_code}: {r.text[:300]}")
@@ -71,7 +81,7 @@ class LivePortraitClient:
     # ---------- assets ----------
     def upload_asset(self, file_bytes: bytes, filename: str, mime: Optional[str] = None) -> dict:
         files = {"file": (filename, file_bytes, mime or "application/octet-stream")}
-        with httpx.Client(timeout=max(self.timeout, 120)) as c:
+        with httpx.Client(timeout=self._timeout(max(self.timeout, 120), self.upload_connect_timeout)) as c:
             r = c.post(self._url("/v1/assets/upload"), files=files)
         if r.status_code >= 400:
             raise LivePortraitError(f"upload -> {r.status_code}: {r.text[:300]}")
@@ -128,7 +138,7 @@ class LivePortraitClient:
 
     def download_result(self, job_id: str, save_to: Path) -> Path:
         save_to.parent.mkdir(parents=True, exist_ok=True)
-        with httpx.Client(timeout=max(self.timeout, 300)) as c:
+        with httpx.Client(timeout=self._timeout(max(self.timeout, 300), self.download_connect_timeout)) as c:
             with c.stream("GET", self._url(f"/v1/jobs/{job_id}/result")) as r:
                 if r.status_code >= 400:
                     raise LivePortraitError(f"download -> {r.status_code}: {r.text[:300]}")
