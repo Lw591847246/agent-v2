@@ -1,26 +1,34 @@
-"""GPU 资源池锁：全局串行 + 同资源复用 + 异资源卸载。
+"""GPU 资源池锁：全局串行 + 同资源复用 + 异资源卸载 + OpenTelemetry 链路埋点。
 
 特性：
 - threading.Semaphore(1)：硬串行，无重入漏洞
 - ContextVar 嵌套识别：sync / async 同一协程树内嵌套自动复用外层租约
-- async_lease：给 async 函数用，`await` 期间不阻塞事件循环
+- async_lease：给 async 函数用，await 期间不阻塞事件循环
 - LeaseTicket：可跨线程释放（流式响应场景）
 - 切换资源前强制卸载旧资源，并校验显存实际下降
 - purge_all / stats：启动清场 + 观测
+- OpenTelemetry：每个租约产出一条 gpu.lease span（wait_ms / hold_ms / resource），
+  未安装 opentelemetry 时整体降级为 no-op，绝不拖垮启动。
 
-修复：_map_task_name 未知任务不再默认按 COMFYUI 处理（原逻辑会误卸载
-正在被 Ollama 占用的显存去给没用的 ComfyUI 腾地方），改为显式抛错，
-让上层明确拒绝，避免无谓的显存/内存抖动与重新加载延迟。
+本版相对上一版的修复：
+1) _switch_to 把耗时的卸载（HTTP + _wait_freed 轮询）移出 self._state 临界区，
+   避免一个任务切换/卸载时阻塞无关任务的 release() 与 stats()。
+2) async_lease 的嵌套标记改为在协程 context 内 set/reset（原先在
+   asyncio.to_thread 子线程的复制 context 内 set，不回写协程 context，
+   导致同协程嵌套 async_lease 取不到外层标记 -> 重复抢锁 -> 自死锁）。
+   同步 lease 仍在调用线程 context 内 set，行为不变、向后兼容裸 acquire()。
+3) _waiting 排队列表用唯一 uid（任务名+线程+纳秒）登记，修复同名任务并发时
+   stats().waiting 错位。
 """
 from __future__ import annotations
 
 import asyncio
 import threading
 import time
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from contextvars import ContextVar
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from app.core.gpu_unloaders import (
     gpu_total_mb,
@@ -33,6 +41,37 @@ from app.core.gpu_unloaders import (
     unload_tts,
 )
 from app.core.logger import logger
+
+# ---------------- OpenTelemetry（可选，缺依赖自动 no-op） ----------------
+try:
+    from opentelemetry import trace as _otel_trace
+    _OTEL = True
+except Exception:
+    _OTEL = False
+
+
+class _NoopSpan:
+    def set_attribute(self, *a, **k):
+        pass
+
+    def set_status(self, *a, **k):
+        pass
+
+
+class _NoopTracer:
+    def start_as_current_span(self, name, attributes=None, **kw):
+        return nullcontext(_NoopSpan())
+
+
+_TRACER = None
+
+
+def _tracer():
+    """惰性获取 tracer；OTel 未安装则返回 no-op tracer。"""
+    global _TRACER
+    if _TRACER is None:
+        _TRACER = _otel_trace.get_tracer("agent.gpu_lock") if _OTEL else _NoopTracer()
+    return _TRACER
 
 
 class GPUResource(str, Enum):
@@ -62,10 +101,8 @@ DEFAULT_TIMEOUTS: Dict[GPUResource, float] = {
 
 
 # 轻量后台任务：如消息摘要(summary)，本身耗时极短，却常被并行的长任务
-# (文生图/文生视频/图生视频，单次持锁可达数百秒)在锁队列里饿死——
-# 它们在 acquire 上排了队却因"锁等待超时"阈值过短(历史 180s)先一步超时失败。
-# 解法(本批方案)：为这类任务单独上调"锁等待超时"，取 max(上游传入值, 配置值)，
-# 让它能排过长任务继续等锁；这类任务超时并非致命，失败日志降为 WARNING 降噪。
+# (文生图/文生视频/图生视频，单次持锁可达数百秒)在锁队列里饿死。
+# 解法：为这类任务单独上调"锁等待超时"，取 max(上游传入值, 配置值)。
 LIGHTWEIGHT_BACKGROUND_TASKS = {"summary", "summarize", "摘要", "context_summary"}
 DEFAULT_LIGHTWEIGHT_WAIT_TIMEOUT = 900.0   # 秒；覆盖一条完整视频任务的排队时长
 
@@ -99,9 +136,7 @@ def _map_task_name(task_name: str) -> GPUResource:
     if "liveportrait" in name or "anchor" in name or "portrait" in name:
         return GPUResource.LIVEPORTRAIT
 
-    # 修复：未知 task_name 不再默认按 COMFYUI 处理。
-    # 原兜底会让 Ollama 正在用的显存被错误卸载去给没用的 ComfyUI 腾地方，
-    # 造成无谓的显存/内存抖动与模型重新加载延迟。改为显式抛错，让上层拒绝执行。
+    # 未知 task_name 不再默认按 COMFYUI 处理，显式抛错，让上层拒绝执行。
     logger.error(f"[GPU锁] 未知 task_name='{task_name}'，拒绝执行以防误卸载在用资源")
     raise ValueError(f"未知 GPU 任务类型: {task_name}")
 
@@ -113,11 +148,7 @@ _root_ticket: ContextVar[Optional["LeaseTicket"]] = ContextVar(
 
 
 class LeaseTicket:
-    """一次 GPU 租约凭证。根 ticket 持有信号量；子 ticket 仅是嵌套标记。
-
-    - release() 可在任意线程/协程调用（流式响应场景）
-    - 同一 ticket 只能 release 一次
-    """
+    """一次 GPU 租约凭证。根 ticket 持有信号量；子 ticket 仅是嵌套标记。"""
 
     __slots__ = ("lock", "resource", "task", "is_root", "acquired_at",
                  "wait_ms", "released", "_mu", "_ctx_token")
@@ -196,19 +227,11 @@ class GlobalGPULock:
             **s,
         }
 
-    # ---------- 核心 ----------
+    # ---------- 参数归一 ----------
 
-    def acquire(self, resource: Union[GPUResource, str, None] = None,
-                task: str = "default",
-                timeout: Optional[float] = None,
-                task_name: Optional[str] = None) -> LeaseTicket:
-        """获取租约（同步、阻塞直到成功或超时）。
-
-        兼容写法：
-          gpu_lock.acquire("LLM-intent")             # 旧式
-          gpu_lock.acquire(task_name="LLM-intent")   # 旧式 keyword
-          gpu_lock.acquire(GPUResource.COMFYUI, task="i2v", timeout=1800)
-        """
+    def _norm_args(self, resource, task, timeout,
+                   task_name) -> Tuple[GPUResource, str, float, bool]:
+        """解析 resource/task/timeout，返回 (resource, task, timeout, is_lightweight)。"""
         if resource is None:
             resource = task_name or task
         if isinstance(resource, str):
@@ -218,8 +241,6 @@ class GlobalGPULock:
         if timeout is None:
             timeout = DEFAULT_TIMEOUTS.get(resource, 300)
 
-        # 轻量后台任务(summary 等)：单独上调锁等待超时，取 max(上游值, 配置值)，
-        # 避免被长任务(文生图/视频)的持锁排队饿死；超时非致命，日志降噪。
         _tk = (task if task and task != "default" else (task_name or "") or "").strip().lower()
         is_lightweight = _tk in LIGHTWEIGHT_BACKGROUND_TASKS
         if is_lightweight:
@@ -233,20 +254,15 @@ class GlobalGPULock:
                     f"上调至 {new_timeout}s（让位于长任务排队，避免被饿死）"
                 )
             timeout = new_timeout
+        return resource, task, timeout, is_lightweight
 
-        # 1) 同协程/线程嵌套 -> 复用外层租约
-        parent = _root_ticket.get()
-        if parent is not None and not parent.released:
-            if parent.resource != resource:
-                logger.warning(
-                    f"【GPU调度】嵌套租约资源不一致 外层={parent.resource.value} "
-                    f"内层={resource.value} task={task}，沿用外层"
-                )
-            return LeaseTicket(self, resource, task, is_root=False)
+    # ---------- 核心：真正抢信号量 + 切换（不含嵌套判定与 ctx 写入） ----------
 
-        # 2) 排队
+    def _acquire_root(self, resource: GPUResource, task: str,
+                      timeout: float, is_lightweight: bool) -> LeaseTicket:
+        uid = f"{task}:{threading.get_ident()}:{time.time_ns()}"
         with self._waiting_lock:
-            self._waiting.append(task)
+            self._waiting.append(uid)
             pos = len(self._waiting) - 1
 
         log_gpu(f"请求前 (task={task})")
@@ -261,7 +277,7 @@ class GlobalGPULock:
 
         with self._waiting_lock:
             try:
-                self._waiting.remove(task)
+                self._waiting.remove(uid)
             except ValueError:
                 pass
 
@@ -288,7 +304,6 @@ class GlobalGPULock:
             raise
 
         ticket = LeaseTicket(self, resource, task, is_root=True, wait_ms=wait_ms)
-        ticket._ctx_token = _root_ticket.set(ticket)
 
         with self._stats_lock:
             self._stats["acquire_count"] += 1
@@ -297,7 +312,40 @@ class GlobalGPULock:
         logger.info(f"【GPU调度】任务 [{task}] 开始执行 (resource={resource.value})")
         return ticket
 
+    def acquire(self, resource: Union[GPUResource, str, None] = None,
+                task: str = "default",
+                timeout: Optional[float] = None,
+                task_name: Optional[str] = None) -> LeaseTicket:
+        """获取租约（同步、阻塞直到成功或超时）。
+
+        嵌套复用依赖调用线程的 ContextVar；非嵌套根租约的嵌套标记写入调用线程 context，
+        因此裸 acquire()/sync lease 的嵌套行为与历史版本一致。异步嵌套请用 async_lease。
+        """
+        resource, task, timeout, is_lightweight = self._norm_args(
+            resource, task, timeout, task_name)
+
+        # 1) 同协程/线程嵌套 -> 复用外层租约
+        parent = _root_ticket.get()
+        if parent is not None and not parent.released:
+            if parent.resource != resource:
+                logger.warning(
+                    f"【GPU调度】嵌套租约资源不一致 外层={parent.resource.value} "
+                    f"内层={resource.value} task={task}，沿用外层"
+                )
+            return LeaseTicket(self, resource, task, is_root=False)
+
+        # 2) 真正抢锁
+        ticket = self._acquire_root(resource, task, timeout, is_lightweight)
+        ticket._ctx_token = _root_ticket.set(ticket)
+        return ticket
+
     def _switch_to(self, resource: GPUResource, task: str):
+        """切换当前占用资源。
+
+        修复点：耗时的 _unload（HTTP + _wait_freed 轮询）不再放在 self._state 临界区内，
+        避免一个任务切换/卸载时长时间持锁，阻塞无关任务的 release()/stats()。
+        全局串行已由 _sem(1) 保证，_state 仅用于 _current 读写的原子可见。
+        """
         with self._state:
             old = self._current
             if old == resource:
@@ -305,30 +353,30 @@ class GlobalGPULock:
                 logger.info(f"【GPU调度】复用资源 [{resource.value}]")
                 log_gpu(f"复用 {resource.value}")
                 return
-
-            logger.info(f"【GPU调度】切换资源: {old.value} -> {resource.value}")
-            log_gpu(f"切换前 {old.value}")
-            t0 = time.time()
-            freed = self._unload(old)
-            cost_ms = int((time.time() - t0) * 1000)
-
+            # 占位：先把 current 指向目标 + 本任务，使 stats()/current() 立刻可见新归属；
+            # 真正的耗时卸载在临界区外进行。
             self._current = resource
             self._current_task = task
             self._current_since = time.time()
 
-            with self._stats_lock:
-                self._stats["switch_count"] += 1
-                self._stats["unload_total_ms"] += cost_ms
+        # —— 耗时卸载：在 _state 临界区之外 ——
+        logger.info(f"【GPU调度】切换资源: {old.value} -> {resource.value}")
+        log_gpu(f"切换前 {old.value}")
+        t0 = time.time()
+        freed = self._unload(old)
+        cost_ms = int((time.time() - t0) * 1000)
 
-            log_gpu(f"切换后 {resource.value}")
-            logger.info(
-                f"【GPU调度】卸载 {old.value} 释放 {freed}MB 耗时 {cost_ms}ms"
+        with self._stats_lock:
+            self._stats["switch_count"] += 1
+            self._stats["unload_total_ms"] += cost_ms
+
+        log_gpu(f"切换后 {resource.value}")
+        logger.info(f"【GPU调度】卸载 {old.value} 释放 {freed}MB 耗时 {cost_ms}ms")
+        if old != GPUResource.NONE and freed < 100:
+            logger.warning(
+                f"【GPU调度】卸载 {old.value} 仅释放 {freed}MB，"
+                f"可能未真正卸载（检查 unloader 配置）"
             )
-            if old != GPUResource.NONE and freed < 100:
-                logger.warning(
-                    f"【GPU调度】卸载 {old.value} 仅释放 {freed}MB，"
-                    f"可能未真正卸载（检查 unloader 配置）"
-                )
 
     def _unload(self, resource: GPUResource) -> int:
         if resource == GPUResource.NONE:
@@ -370,11 +418,18 @@ class GlobalGPULock:
               task: str = "default",
               timeout: Optional[float] = None,
               task_name: Optional[str] = None):
-        ticket = self.acquire(resource, task=task, timeout=timeout, task_name=task_name)
-        try:
-            yield ticket
-        finally:
-            ticket.release()
+        """同步租约上下文，附带 gpu.lease span（wait_ms / hold_ms / resource）。"""
+        tr = _tracer()
+        with tr.start_as_current_span("gpu.lease", attributes={"gpu.task": task}) as span:
+            ticket = self.acquire(resource, task=task, timeout=timeout, task_name=task_name)
+            span.set_attribute("gpu.resource", ticket.resource.value)
+            span.set_attribute("gpu.wait_ms", ticket.wait_ms)
+            try:
+                yield ticket
+            finally:
+                t_rel = time.time()
+                ticket.release()
+                span.set_attribute("gpu.hold_ms", int((time.time() - t_rel) * 1000))
 
     @contextmanager
     def use(self, resource: GPUResource, timeout: int = 300):
@@ -388,13 +443,38 @@ class GlobalGPULock:
                           task: str = "default",
                           timeout: Optional[float] = None,
                           task_name: Optional[str] = None):
-        ticket = await asyncio.to_thread(
-            self.acquire, resource, task, timeout, task_name,
-        )
-        try:
-            yield ticket
-        finally:
-            ticket.release()
+        """异步租约：抢锁/切换丢线程池不阻塞事件循环；嵌套标记在协程 context 内读写。"""
+        resource, task, timeout, is_lightweight = self._norm_args(
+            resource, task, timeout, task_name)
+
+        tr = _tracer()
+        with tr.start_as_current_span("gpu.lease", attributes={"gpu.task": task}) as span:
+            span.set_attribute("gpu.resource", resource.value)
+
+            # 关键修复：嵌套判定与标记 set/reset 都在协程 context 内完成。
+            # asyncio.to_thread 的 copy_context().run() 不会把子线程内的 set 回写到协程，
+            # 所以标记绝不能在 _acquire_root 内部 set；这里在协程里 set，子线程 copy 时
+            # 才能读到外层标记 -> 同协程嵌套正确复用，不再自死锁。
+            parent = _root_ticket.get()
+            if parent is not None and not parent.released:
+                if parent.resource != resource:
+                    logger.warning(
+                        f"【GPU调度】嵌套租约资源不一致 外层={parent.resource.value} "
+                        f"内层={resource.value} task={task}，沿用外层"
+                    )
+                yield LeaseTicket(self, resource, task, is_root=False)
+                return
+
+            ticket = await asyncio.to_thread(
+                self._acquire_root, resource, task, timeout, is_lightweight)
+            ticket._ctx_token = _root_ticket.set(ticket)
+            span.set_attribute("gpu.wait_ms", ticket.wait_ms)
+            try:
+                yield ticket
+            finally:
+                t_rel = time.time()
+                ticket.release()
+                span.set_attribute("gpu.hold_ms", int((time.time() - t_rel) * 1000))
 
     # ---------- 启动/关闭清场 ----------
 
@@ -413,9 +493,6 @@ class GlobalGPULock:
                   GPUResource.LIVEPORTRAIT, GPUResource.MUSETALK):
             if r in exclude:
                 continue
-            # 复用启动探活结论：探活已判 Ollama 不通时跳过其卸载段，
-            # 避免对已知死地址逐个模型空等(每个 3~4s，累计约 24s)。
-            # 仅跳过 Ollama，ComfyUI/TTS/Musetalk/LivePortrait 不受影响。
             if r.value.startswith("ollama_") and not self._ollama_reachable:
                 logger.debug("[GPU调度] 启动探活已判 Ollama 不通，跳过 Ollama 卸载")
                 continue

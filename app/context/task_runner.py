@@ -15,6 +15,9 @@ from typing import Callable, Optional
 
 from app.core.context import RequestContext
 from app.core.logger import logger
+from app.core.tracing import (
+    capture_context, attach_context, detach_context, get_tracer, current_trace_ids,
+)
 from app.infrastructure.repositories.conversation_repo import conversation_repo
 from app.infrastructure.repositories.task_repo import task_repo
 
@@ -56,9 +59,14 @@ class TaskRunner:
 
         # threading.Thread 不继承 contextvar：主线程先取出来，传进子线程再 set
         trace_id = RequestContext.get_trace_id()
+        # ⭐ 链路追踪：捕获发起请求的 OTel 上下文快照（含当前 HTTP/业务 span）。
+        #    OTel 的 current-span 同样是 contextvar，子线程不会自动继承，必须显式
+        #    capture->attach，后台任务的 span 才能挂在发起它的请求 trace 下，
+        #    在 Jaeger 里看到 "HTTP 请求 -> 异步任务 -> ComfyUI 调用" 一条完整链。
+        otel_ctx = capture_context()
         threading.Thread(
             target=self._run,
-            args=(task_id, fn, trace_id, session_id, str(user_id)),
+            args=(task_id, fn, trace_id, session_id, str(user_id), provider, otel_ctx),
             daemon=True,
         ).start()
 
@@ -73,18 +81,50 @@ class TaskRunner:
     def _run(
         self, task_id: str, fn: Callable[[str], None],
         trace_id: str, session_id: str, user_id: str,
+        provider: str = "local", otel_ctx=None,
     ) -> None:
         # 子线程入口重建请求上下文，使后台任务日志也能带上 trace_id
         RequestContext.set_trace_id(trace_id)
         RequestContext.set_session_id(session_id)
         RequestContext.set_user_id(user_id)
         RequestContext.set_extra_fields(task_type=task_id.split("_", 1)[0])
+
+        # ⭐ 链路追踪：把父请求的 OTel 上下文 attach 到本线程，使 task 级 span
+        #    自动成为发起请求 span 的子 span（OTel 未启用时全部安全空转）。
+        token = attach_context(otel_ctx)
+        tracer = get_tracer("task_runner")
+        sp = tracer.start_span(
+            "task.run",
+            attributes={
+                "task.id": task_id,
+                "task.skill": task_id.split("_", 1)[0],
+                "task.provider": provider,
+                "session.id": session_id,
+                "app.trace_id": trace_id,  # 与日志 trace_id 交叉印证
+            },
+        )
         try:
+            ot_tid, _ = current_trace_ids()
+            if ot_tid:
+                sp.set_attribute("otel.trace_id", ot_tid)
             fn(task_id)
+            sp.set_attribute("task.result", "done")
         except Exception as e:
             logger.error(f"[TaskRunner] task_id={task_id} 执行失败: {e}", exc_info=True)
+            try:
+                sp.set_attribute("task.result", "failed")
+                sp.set_attribute("error", True)
+                sp.set_attribute("error.message", str(e)[:500])
+                sp.record_exception(e)
+            except Exception:
+                pass
             self.fail(task_id, str(e))
         finally:
+            try:
+                sp.end()
+            except Exception:
+                pass
+            detach_context(token)
             with self._running_lock:
                 self._running -= 1
             self._sem.release()
