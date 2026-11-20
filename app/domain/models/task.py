@@ -27,6 +27,7 @@ class TaskInfo(BaseModel):
     outputs_json: Optional[str] = None
     output_path: Optional[str] = None
     result_url: Optional[str] = None
+    msg_id: Optional[int] = None
     error: Optional[str] = None
 
     created_at: Optional[str] = None

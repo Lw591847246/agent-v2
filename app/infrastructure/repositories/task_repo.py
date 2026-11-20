@@ -94,6 +94,7 @@ class TaskRepo:
             "provider_job_id", "status", "progress",
             "output_path", "error", "finished_at", "slots",
             "skill_name", "msg", "steps_json", "parts_json", "outputs_json", "duration_ms",
+            "msg_id",
         }
         cols, vals = [], []
         for k, v in fields.items():
@@ -124,6 +125,37 @@ class TaskRepo:
         if steps is not None:
             fields["steps_json"] = json.dumps(steps, ensure_ascii=False)
         self.update(task_id, **fields)
+
+    # ---------- msg_id 显式关联（根治补丁新增）----------
+    def set_msg_id(self, task_id: str, msg_id: int) -> None:
+        """把回填目标 assistant 消息 id 显式写回任务行。
+        由 chat_service.finalize 在占位消息落库成功后调用，建立 task -> msg 的显式外键。
+        """
+        try:
+            self.update(task_id, msg_id=int(msg_id))
+            logger.info(f"[TaskRepo] set_msg_id task_id={task_id} msg_id={msg_id}")
+        except Exception as e:
+            logger.warning(f"[TaskRepo] set_msg_id failed task_id={task_id}: {e}")
+
+    def get_msg_id(self, task_id: str, timeout: float = 2.0, interval: float = 0.2) -> int:
+        """读取任务的显式 msg_id。
+
+        根治点：后台任务（异步 skill 的 _run_async / task_runner.finish）不再用
+        'content LIKE %task_id%' 反查占位消息，而是直接读 agent_video_task.msg_id。
+        占位消息由 finalize 在请求返回时落库并回写，通常远早于后台任务完成；
+        但秒级任务可能后台先于 finalize 完成，故这里带"等待重试"封死时序竞态：
+        msg_id 尚未写入时轮询等待，超过 timeout 仍为空则返回 0（由调用方走兜底）。
+        """
+        import time
+        deadline = time.time() + timeout
+        while True:
+            info = self.get(task_id)
+            mid = getattr(info, "msg_id", None) if info else None
+            if mid:
+                return int(mid)
+            if time.time() >= deadline:
+                return 0
+            time.sleep(interval)
 
     # ---------- finish ----------
     def finish(
@@ -318,6 +350,7 @@ def _row_to_info(row: dict) -> TaskInfo:
         provider=row.get("provider") or "local",
         provider_job_id=row.get("provider_job_id"),
         status=status,
+        msg_id=(int(row["msg_id"]) if row.get("msg_id") not in (None, "") else None),
         progress=int(row.get("progress") or 0),
         duration_ms=int(row.get("duration_ms") or 0),
         msg=row.get("msg"),
@@ -333,3 +366,4 @@ def _row_to_info(row: dict) -> TaskInfo:
 
 
 task_repo = TaskRepo()
+

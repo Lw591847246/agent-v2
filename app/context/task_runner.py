@@ -112,7 +112,10 @@ class TaskRunner:
 
         if session_id:
             try:
-                msg_id = conversation_repo.get_message_id_by_task_id(session_id, task_id)
+                msg_id = task_repo.get_msg_id(task_id)
+                if not msg_id:
+                    # 兜底：仅当显式 msg_id 仍未就绪时退回旧的 LIKE 反查
+                    msg_id = conversation_repo.get_message_id_by_task_id(session_id, task_id)
                 if msg_id:
                     update_kwargs = {
                         "message_id": msg_id,
@@ -155,7 +158,9 @@ class TaskRunner:
             return
 
         try:
-            msg_id = conversation_repo.get_message_id_by_task_id(session_id, task_id)
+            msg_id = task_repo.get_msg_id(task_id)
+            if not msg_id:
+                msg_id = conversation_repo.get_message_id_by_task_id(session_id, task_id)
             if not msg_id:
                 logger.warning(f"[TaskRunner] fail 找不到 msg_id task_id={task_id}")
                 return
@@ -218,3 +223,4 @@ class TaskRunner:
 
 
 task_runner = TaskRunner()
+

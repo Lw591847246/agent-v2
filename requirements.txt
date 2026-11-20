@@ -1,1 +1,16 @@
 # requirements.txt
+
+
+# ===== OpenTelemetry 链路追踪依赖（接入链路追踪时追加）=====
+# 核心 API/SDK
+opentelemetry-api>=1.27,<2
+opentelemetry-sdk>=1.27,<2
+# 导出端（按你选的导出口径，至少装其一；otlp 用于接 Jaeger/Tempo/Collector）
+opentelemetry-exporter-otlp-proto-http>=1.27,<2
+# 自动埋点（可选但强烈推荐：自动为 FastAPI 请求、requests 外部调用生成 span）
+opentelemetry-instrumentation>=0.48b0
+opentelemetry-instrumentation-fastapi>=0.48b0
+opentelemetry-instrumentation-requests>=0.48b0
+# 说明：tracing.py 已做"未安装即 no-op"降级。即使不装上面这些，
+# 业务代码（task_runner 等）也不会因 import 失败而启动报错，
+# 只是没有 span 数据。装齐后重启即生效，无需再改业务代码。
