@@ -1,7 +1,8 @@
-﻿app:
+app:
   name: personal-agent
   version: 2.0.0
   env: dev
+  docs_enabled: false
 
 server:
   host: 0.0.0.0
@@ -9,21 +10,64 @@ server:
   workers: 1          # ⚠️ 必须为 1，GlobalGPULock 是进程级锁
 
 # ==========================================
-# GPU 资源池锁（新增）
+# GPU 资源池锁
 # ==========================================
 gpu:
-  purge_on_start: true       # 启动清场（清掉上次进程残留显存）
-  purge_on_shutdown: true    # 关闭清场（可选，建议 true）
+  purge_on_start: true
+  purge_on_shutdown: true
 
 # ==========================================
 # health（启动探活）
 # ==========================================
 health:
-  fail_fast: true                # true=Ollama 不通则阻断启动；false=仅告警
-  probe_timeout: 5               # 单次探活超时
-  check_ollama: true             # Ollama 核心，建议 true
-  check_comfyui: false           # 图/视频链路存在再开
+  fail_fast: true
+  probe_timeout: 5
+  check_ollama: true
+  check_comfyui: false
 
+# ==========================================
+# 后台任务闸（task_runner）
+# ==========================================
+task:
+  max_concurrent: 3        # 全局同时运行的后台任务数（可被 env TASK_MAX_CONCURRENT 覆盖）
+  max_per_user: 2          # 单个用户同时运行的后台任务数（防一人占满全局闸）
+
+# ==========================================
+# 上传限制（file_upload_service 强制校验）
+# ==========================================
+upload:
+  max_size_mb: 20          # 单文件上限
+  max_total_mb: 100        # 单次请求多文件合计上限
+  magic_check: true        # 校验文件头（防 .png 里装可执行内容）
+  allowed_extensions:
+    - jpg
+    - jpeg
+    - png
+    - webp
+    - bmp
+    - gif
+    - mp4
+    - mov
+    - avi
+    - mkv
+    - webm
+    - mp3
+    - wav
+    - m4a
+    - aac
+    - ogg
+    - flac
+    - pdf
+    - doc
+    - docx
+    - xls
+    - xlsx
+    - ppt
+    - pptx
+    - txt
+    - md
+    - csv
+    - json
 
 # ==========================================
 # 服务注册 & 第三方工作流集成
@@ -40,13 +84,13 @@ services:
     text_2_image_path: app/config/workflows/Qwen_Image_2.1_GGUF_Text2Image.json
     image_2_image_path: app/config/workflows/Qwen_Image_2.1_GGUF_Image2Image_Edit.json
     read_timeout: 600
-    poll_interval: 3             # 轮询间隔
-    poll_timeout: 600            # 轮询总时长上限
+    poll_interval: 3
+    poll_timeout: 600
     timeout:
-      connect: 8                 # 建连：进程没起/端口不通秒级失败
-      submit: 30                 # /prompt 提交、/upload 上传 单次 read
-      query: 10                  # /history 单次 read
-      download: 60               # /view 下载 read
+      connect: 8
+      submit: 30
+      query: 10
+      download: 60
   face_swap:
     base_url: http://127.0.0.1:8188
     workflow_path: app/config/workflows/face_swap.json
@@ -114,12 +158,7 @@ services:
         cfg: 7.5
 
   tts:
-    # TTS 上游卸载端点（多个 URL 会依次尝试）
-    # 你的 CosyVoice2 / IndexTTS2 如果有 /unload、/api/unload 之类的端点，填进来
-    # 留空 [] 则自动探测（/unload /api/unload /v1/unload /release /free）
     unload_urls: []
-    # 所有 URL 都失败时是否 taskkill 兜底
-    # ⚠️ 本代码仅在 gpu_unloaders.py 里打印告警，不会主动 kill 进程
     taskkill_enabled: false
 
   search:
@@ -137,23 +176,19 @@ services:
       circuit_threshold: 5
       circuit_cooldown: 300
       relevance_prefilter: true
+      # ⭐ 出站抓取的 SSRF 防护（见 app/utils/net_guard.py）
+      block_private_ips: true      # 拦截 127/10/172.16/192.168/169.254/::1 等
+      max_redirects: 3             # 手动跟随重定向，每一跳都重新校验 IP
 
   searxng:
     base_url: ""
-
 
 # ==========================================
 # Ollama 模型服务与 GPU 调度策略
 # ==========================================
 ollama:
-  # ⭐ 必须是不带路径的 host！
-  # 原值 "http://localhost:11434/api/chat" 会让 unload_ollama 拼成
-  # ".../api/chat/api/generate" 而 404
-  # 新 unload_ollama 已加 _strip_api_path 兜底，但推荐直接改成纯 host
   base_url: "http://localhost:11434"
 
-  # 可选：多机分片时按 service 覆盖源；未覆盖的自动回落 base_url
-  # 单机部署时整段可不写，行为与现在一致
   hosts:
     # intent:    "http://gpu-a:11434"
     # chat:      "http://gpu-a:11434"
@@ -162,12 +197,11 @@ ollama:
     # ocr:       "http://gpu-b:11434"
     # embedding: "http://gpu-b:11434"
 
-  # 分层超时（秒）
   timeout:
-    connect: 8        # 建连：源没起 / 端口不通时秒级失败，不再空等 read
-    read_chat: 180    # 非流式：等完整响应
-    read_stream: 120  # 流式：相邻块间隔，同时充当首 token 超时
-    unload: 3         # keep_alive=0 卸载请求的超时
+    connect: 8
+    read_chat: 180
+    read_stream: 120
+    unload: 3
 
   models:
     intent: "qwen2.5:7b"
@@ -179,18 +213,10 @@ ollama:
     ocr: qwen2.5vl:7b
     embedding: bge-m3:latest
 
-  # ⭐ 显存常驻策略
-  # 说明：
-  #   "-1"  → 永不卸载（4.7G 一直占着）
-  #   "0"   → 用完立刻卸载
-  #   "30m" → 空闲 30 分钟后卸载
-  # GPU 锁会在切换到其他资源（ComfyUI / TTS / LP）时主动对 ALL 模型发 keep_alive=0，
-  # 所以 "intent: -1" 的常驻在切换时也会被强制卸载——
-  # 建议改成 "30m"，避免每次切走再切回都重加载 7B（加载 3-5 秒）。
   keep_alive:
-    intent: "30m"          # 从 "-1" 改为 "30m"
+    intent: "30m"
     intent_large: "0"
-    chat: "30m"            # 与 intent 同模型时共驻留
+    chat: "30m"
     reasoning: "0"
     code: "0"
     vision: "0"
@@ -200,9 +226,8 @@ ollama:
   default_num_ctx: 16384
   default_temperature: 0.6
 
-
 # ==========================================
-# 数据库与中间件
+# 数据库与中间件（密钥走环境变量 / .env）
 # ==========================================
 mysql:
   host: localhost
@@ -211,36 +236,64 @@ mysql:
   charset: utf8mb4
   pool_size: 10
   user: root
-  password: "123456"
+  # ⚠️ 默认值只为本地开发；生产请删掉默认值，只留 ${MYSQL_PASSWORD}
+  password: "${MYSQL_PASSWORD:-123456}"
 
 redis:
   host: localhost
   port: 6379
   db: 0
-  password: null
   pool_size: 10
   token_expire_seconds: 86400
+  # 无密码时留空（redis_client 会把空串当 None）
+  password: "${REDIS_PASSWORD:-}"
 
 auth:
+  # ⚠️ 只放"没有用户态"的路径。业务路径一律不要放进来：
+  # AuthInterceptor._is_white_list 是前缀匹配，一旦命中就直接返回 anonymous。
   white_list:
     - /auth/login
     - /auth/register
-    - /docs
-    - /openapi.json
     - /health
-    - /agent/v1/thumb/
-    - /agent/v1/image/
-    - /agent/v1/upload/thumb/
+    - /healthz
+    - /readyz
 
+  # 下载类接口授权策略：
+  #   true  = 必须"签名有效"或"登录态+归属"（最终态）
+  #   false = 过渡灰度：未签名且未登录也放行，仅打 warning
+  require_download_auth: true
+  # —— 运维端点守卫（本轮新增）———————————————————————————————
+  # /metrics、/docs、/openapi.json 已从 white_list 移出，改由此守卫把关：
+  #   配了 ops_token  -> 必须带 X-Ops-Token 或 Bearer <ops_token>
+  #   否则配 ops_allow_ips -> 来源 IP 必须命中白名单
+  #   两者都没配     -> 统一 404（隐藏端点存在，fail-closed）
+  ops_paths:
+    - /metrics
+    - /docs
+    - /docs/oauth2-redirect
+    - /redoc
+    - /openapi.json
+  ops_token: ""
+  ops_allow_ips: []
+  ops_trust_forwarded_for: false
 rate_limit:
   enabled: true
   default_qps: 10
   chat_qps: 5
   upload_qps: 2
-  retention_seconds: 300         # key 闲置多久可回收（须 > 1s 窗口）
-  sweep_interval: 60             # 两次清扫最小间隔
-  max_keys: 50000                # key 总量硬上限，逼近即强制清扫
+  retention_seconds: 300
+  sweep_interval: 60
+  max_keys: 50000
+  # —— 真实客户端 IP（本轮新增，反代后限流不再退化）——————————
+  # remote_only = 仅当直连对端属于 trusted_proxies 时才信任转发头（推荐）
+  # always      = 一定部署在可信反代后面时用；never = 永远只看 socket 对端
+  trust_forwarded_for: remote_only
+  prefer_real_ip: false
+  trusted_proxies:
+    - "127.0.0.1"
+    - "::1"
 
+# 文档解析相关（与上传白名单分开，互不影响）
 file:
   max_file_tokens: 4096
   max_file_size_mb: 20
@@ -262,7 +315,6 @@ vector_store:
   chunk_size: 500
   chunk_overlap: 50
   top_k: 5
-
 
 # ==========================================
 # Agent 编排配置
@@ -297,22 +349,51 @@ storyboard:
   output_height: 1280
   max_scenes: 6
 
-
 # ==========================================
 # TTS 配置
 # ==========================================
 tts:
-  # ⭐ 切换引擎只需改这里
   engine: cosyvoice2
-
   default_ref_audio: "./data/voices/anime_narrator.wav"
 
   cosyvoice2:
     base_url: "http://127.0.0.1:9011"
-    # ⚠️ 6000 秒 = 100 分钟，如果你 TTS 真的会跑这么久就保留；
-    # 否则建议改 300（5 分钟），避免一次卡死把 sem 占 100 分钟
     timeout: 6000
 
   indextts2:
     base_url: "http://127.0.0.1:9010"
     timeout: 6000
+
+tracing:
+  console: true
+  service: agent-v2
+  otlp_endpoint: ""
+  version: dev
+  file: logs/spans.jsonl
+  export_timeout: 10
+
+# ==========================================
+# 安全基线（本轮新增）
+# ==========================================
+cors:
+  # 生产必须收敛成具体域名列表，例如：
+  #   allow_origins: ["https://your-frontend.example.com"]
+  # allow_credentials=true 时禁止 allow_origins 为 *（bootstrap 会强制降级）
+  allow_origins: "*"
+  allow_methods: "*"
+  allow_headers: "*"
+  allow_credentials: false
+
+security:
+  # 签名下载 URL 的默认时效（秒）。默认 7 天；到期后前端重新拉消息/任务即可换新链接。
+  default_url_ttl_seconds: 604800
+  # tts / liveportrait_job 没有可靠归属元数据，默认禁止显式签发签名（fail-closed）。
+  # 置 true 会重新允许越权签发，属危险开关。
+  allow_sign_ownerless: false
+
+# 签名密钥（不在 yml 里存值，只从环境变量读；未配置则服务启动即失败）
+#   SIGNED_URL_SECRET=<openssl rand -hex 32>
+#   SIGNED_URL_DEFAULT_TTL=604800
+#   SIGNED_URL_ALLOW_LEGACY_PERMANENT=true    # 灰度期兼容 exp=0 老链接，收口后置 false
+
+

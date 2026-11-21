@@ -1,4 +1,4 @@
-﻿# app/application/tts_service.py
+﻿# app/infrastructure/services/tts_service.py
 """TTS 服务：配置驱动，支持 IndexTTS2 / CosyVoice2 平滑切换。
 
 GPU 锁说明：
@@ -8,6 +8,7 @@ GPU 锁说明：
 - 资源类型按 config.tts.engine 自动选择 INDEXTTS2 / COSYVOICE2
 """
 import os
+import re
 
 from app.config.loader import config
 from app.core.gpu_lock import GPUResource, gpu_lock
@@ -15,6 +16,9 @@ from app.core.logger import logger
 from app.infrastructure.tts.base import BaseTTSEngine
 from app.infrastructure.tts.indextts_engine import IndexTTSEngine
 from app.infrastructure.tts.cosyvoice_engine import CosyVoiceEngine
+
+
+_SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
 
 
 class TtsService:
@@ -48,7 +52,6 @@ class TtsService:
             )
             logger.info(f"[TtsService] ✅ 使用 IndexTTS2 引擎 ({base_url})")
 
-    # ⭐ 根据当前 engine 选择 GPU 资源类型；不影响接口
     def _resource(self) -> GPUResource:
         name = (config.get("tts.engine", "indextts2") or "indextts2").lower()
         return GPUResource.COSYVOICE2 if name == "cosyvoice2" else GPUResource.INDEXTTS2
@@ -60,18 +63,16 @@ class TtsService:
         return int(config.get("tts.indextts2.timeout", "6000"))
 
     # ============================================================
-    # 对外接口（签名与原来完全一致）
+    # 对外接口
     # ============================================================
 
     def synthesize_wav(self, text: str, voice: str = "") -> str:
-        # 同步方法：直接 with 锁
         with gpu_lock.lease(
             self._resource(), task="tts-wav", timeout=self._timeout(),
         ):
             return self._engine.synthesize_wav(text, voice)
 
     async def synthesize(self, text: str, voice: str = ""):
-        # 异步方法：async with，不阻塞事件循环
         async with gpu_lock.async_lease(
             self._resource(), task="tts", timeout=self._timeout(),
         ):
@@ -94,7 +95,23 @@ class TtsService:
         return self._engine.list_voices()
 
     def get_audio_path(self, filename: str) -> str:
-        return self._engine.get_audio_path(filename)
+        """获取音频文件路径（文件名硬校验：只允许纯文件名，杜绝路径穿越）。
+
+        - 拒绝任何分隔符、..、NUL
+        - 再走 basename 兜底
+        - 结果路径不在 engine 目录内视为异常返回 ""
+        """
+        if not filename or "\x00" in filename:
+            logger.warning(f"[TtsService] 非法 filename: {filename!r}")
+            return ""
+        if "/" in filename or "\\" in filename or ".." in filename:
+            logger.warning(f"[TtsService] 非法 filename: {filename!r}")
+            return ""
+        if not _SAFE_FILENAME_RE.match(filename):
+            logger.warning(f"[TtsService] 非法 filename: {filename!r}")
+            return ""
+        name = os.path.basename(filename)
+        return self._engine.get_audio_path(name)
 
     def warmup(self) -> None:
         pass

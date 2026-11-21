@@ -9,6 +9,9 @@ class ConversationRepository(ABC):
     def exists(self, session_id: str) -> bool: ...
 
     @abstractmethod
+    def exists_for_user(self, session_id: str, user_id: str) -> bool: ...
+
+    @abstractmethod
     def create(self, session_id: str, user_id: str, title: str = None): ...
 
     @abstractmethod

@@ -339,6 +339,21 @@ class GlobalGPULock:
         ticket._ctx_token = _root_ticket.set(ticket)
         return ticket
 
+    @contextmanager
+    def bind(self, ticket: LeaseTicket):
+        """把已存在的租约 ticket 绑到当前线程 context。用于 StreamingResponse 跨线程消费。"""
+        if ticket is None or ticket.released or not ticket.is_root:
+            yield
+            return
+        tok = _root_ticket.set(ticket)
+        try:
+            yield
+        finally:
+            try:
+                _root_ticket.reset(tok)
+            except Exception:
+                pass
+
     def _switch_to(self, resource: GPUResource, task: str):
         """切换当前占用资源。
 
@@ -363,7 +378,15 @@ class GlobalGPULock:
         logger.info(f"【GPU调度】切换资源: {old.value} -> {resource.value}")
         log_gpu(f"切换前 {old.value}")
         t0 = time.time()
-        freed = self._unload(old)
+
+        try:
+            freed = self._unload(old)
+        except Exception:
+            with self._state:
+                self._current = GPUResource.NONE
+                self._current_task = ""
+            raise
+
         cost_ms = int((time.time() - t0) * 1000)
 
         with self._stats_lock:

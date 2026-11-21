@@ -1,5 +1,14 @@
 # app/skills/storyboard/service.py
-"""Storyboard 业务：拆场景 → TTS → 出图 → FFmpeg 合成。"""
+"""Storyboard 业务：拆场景 → TTS → 出图 → FFmpeg 合成。
+
+本轮改动（相对原始版本）
+1. `regenerate()` 增加 user_id 入参并透传给 submit —— 修复"重新生成出来的任务
+   在 agent_video_task 里 user_id=0"的问题（下载/进度接口会因此判不出归属）；
+2. manifest 增加 `user_id` 字段，供 regenerate 在未显式传参时兜底；
+3. 下载 URL 改成带 HMAC 签名的形式（浏览器 <a href>/<video src> 带不了
+   Authorization 头，只靠登录态会 401）；
+4. `datetime` 移到文件顶部导入（原实现放在文件末尾，属隐式依赖）。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,13 +17,14 @@ import json
 import os
 import subprocess
 import time
+from datetime import datetime
 
 from app.config.loader import config
 from app.context.task_runner import task_runner
 from app.contracts.result import build_output
+from app.core.gpu_lock import gpu_lock
 from app.core.logger import logger
 from app.infrastructure.clients.comfyui_i2v_client import comfyui_i2v_client  # noqa: F401
-from app.core.gpu_lock import gpu_lock
 from app.infrastructure.clients.model_manager import model_manager
 from app.infrastructure.clients.qwen_Image_client import qwen_image_client
 from app.infrastructure.repositories.conversation_repo import conversation_repo
@@ -23,6 +33,7 @@ from app.skills.storyboard.composer import build_storyboard_video
 from app.skills.storyboard.splitter import (
     STYLE_PROFILES, split_story_to_scenes,
 )
+from app.utils.signed_url import sign_url
 
 
 # 项目根（app/skills/storyboard/service.py → ../../../../ = agent-v2）
@@ -97,6 +108,22 @@ def _save_manifest(workdir, manifest):
         logger.warning(f"[Storyboard] manifest 保存失败: {e}")
 
 
+def _read_manifest(original_task_id: str) -> dict:
+    manifest_path = os.path.join(STORYBOARD_ROOT, original_task_id, "manifest.json")
+    if not os.path.isfile(manifest_path):
+        raise FileNotFoundError(f"找不到原任务 manifest: {original_task_id}")
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def storyboard_video_url(task_id: str) -> str:
+    """storyboard 下载地址（带签名，浏览器可直接访问）。"""
+    return (
+        f"/agent/v1/storyboard/download?task_id={task_id}"
+        f"&{sign_url('storyboard', task_id)}"
+    )
+
+
 class StoryboardService:
 
     def submit(
@@ -106,7 +133,9 @@ class StoryboardService:
         def _fn(task_id: str):
             workdir = os.path.join(STORYBOARD_ROOT, task_id)
             os.makedirs(workdir, exist_ok=True)
-            self._run_pipeline(task_id, session_id, story, style, workdir)
+            self._run_pipeline(
+                task_id, session_id, story, style, workdir, user_id=user_id,
+            )
 
         task_id = task_runner.submit(
             skill_name="storyboard",
@@ -120,6 +149,7 @@ class StoryboardService:
 
     def _run_pipeline(
         self, task_id: str, session_id: str, story: str, style: str, workdir: str,
+        user_id: int = 0,
     ) -> None:
         start_time = time.time()
         steps = [
@@ -223,7 +253,7 @@ class StoryboardService:
 
             duration_ms = int((time.time() - start_time) * 1000)
             title = outline.get("title", "AI 漫剧")
-            video_url = f"/agent/v1/storyboard/download?task_id={task_id}"
+            video_url = storyboard_video_url(task_id)
 
             final_parts = [
                 {"type": "video", "url": video_url, "task_id": task_id},
@@ -238,7 +268,8 @@ class StoryboardService:
             )]
 
             _save_manifest(workdir, {
-                "task_id": task_id, "session_id": session_id, "title": title,
+                "task_id": task_id, "session_id": session_id, "user_id": user_id,
+                "title": title,
                 "style": style, "mode": mode, "story": story, "scenes": scenes,
                 "overview_visual_hint": outline.get("overview_visual_hint", ""),
                 "audio_path": audio_path, "audio_duration": audio_duration,
@@ -252,39 +283,59 @@ class StoryboardService:
                 output_path=final_path, duration_ms=duration_ms,
                 session_id=session_id,
             )
-            logger.info(f"[Storyboard] 完成 task_id={task_id}")
+            logger.info(f"[Storyboard] 完成 task_id={task_id} user={user_id}")
 
         except Exception as e:
             logger.error(f"[Storyboard] 失败 task_id={task_id}: {e}", exc_info=True)
             task_runner.fail(task_id, str(e), session_id=session_id)
 
     # ---------- regenerate ----------
-    def regenerate(self, original_task_id: str, extra_instruction: str = "") -> str:
-        """基于原任务的 manifest 重新生成，返回新 task_id。"""
-        manifest_path = os.path.join(STORYBOARD_ROOT, original_task_id, "manifest.json")
-        if not os.path.isfile(manifest_path):
-            raise FileNotFoundError(f"找不到原任务 manifest: {original_task_id}")
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
+    def regenerate(
+        self, original_task_id: str, user_id: int = 0, extra_instruction: str = "",
+    ) -> str:
+        """基于原任务的 manifest 重新生成，返回新 task_id。
+
+        user_id 由 controller 传入（controller 已校验原任务归属），
+        保证新任务行也带着正确的归属，下载/进度接口才能判权。
+        """
+        manifest = _read_manifest(original_task_id)
+
         story = manifest.get("story", "")
         style = manifest.get("style", "realistic_cinema")
         session_id = manifest.get("session_id", "")
         if not story:
             raise ValueError("原任务 manifest 中缺少 story")
+        if not session_id:
+            raise ValueError("原任务 manifest 中缺少 session_id")
+
+        # 老 manifest 没有 user_id，用调用方传入的（已鉴权）值兜底
+        owner = int(user_id or manifest.get("user_id") or 0)
         if extra_instruction:
             story = f"{story}\n\n【修改要求】{extra_instruction}"
-        return self.submit(session_id=session_id, story=story, style=style)
 
+        logger.info(
+            f"[Storyboard] regenerate 原任务={original_task_id} "
+            f"session={session_id} user={owner}"
+        )
+        return self.submit(session_id=session_id, story=story, style=style, user_id=owner)
 
-# 兼容旧名（controller 用）
-from datetime import datetime  # noqa: E402
 
 storyboard_service = StoryboardService()
 
 
-def submit_storyboard_task(session_id: str, story: str, style: str = "realistic_cinema", user_id: int = 0) -> str:
-    return storyboard_service.submit(session_id=session_id, story=story, style=style, user_id=user_id)
+def submit_storyboard_task(
+    session_id: str, story: str, style: str = "realistic_cinema", user_id: int = 0,
+) -> str:
+    return storyboard_service.submit(
+        session_id=session_id, story=story, style=style, user_id=user_id,
+    )
 
 
-def regenerate_storyboard_task(original_task_id: str, extra_instruction: str = "") -> str:
-    return storyboard_service.regenerate(original_task_id, extra_instruction)
+def regenerate_storyboard_task(
+    original_task_id: str, user_id: int = 0, extra_instruction: str = "",
+) -> str:
+    return storyboard_service.regenerate(
+        original_task_id=original_task_id,
+        user_id=user_id,
+        extra_instruction=extra_instruction,
+    )

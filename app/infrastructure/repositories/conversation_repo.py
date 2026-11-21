@@ -6,11 +6,54 @@ from typing import Any, Dict, List, Optional
 from app.core.logger import logger
 from app.domain.repositories.conversation_repository import ConversationRepository
 from app.infrastructure.repositories.base_repo import BaseRepo
+from app.utils.signed_url import sign
 
 
 class ConversationRepoImpl(BaseRepo, ConversationRepository):
 
     # ============ 会话 ============
+
+    def get_all_messages(self, session_id, user_id=None):
+        if not user_id:
+            return []
+        rows = self.query_list(
+            "SELECT m.id, m.role, m.content, m.message_type, m.outputs, "
+            "m.image_filename, m.thumb_filename, m.client_id, m.duration_ms, m.created_at "
+            "FROM agent_message m "
+            "JOIN agent_conversation c ON m.session_id = c.session_id "
+            "WHERE m.session_id=%s AND c.user_id=%s "
+            "ORDER BY m.id ASC",
+            (session_id, user_id),
+        )
+        result = []
+        for r in rows:
+            item = {
+                "id": r["id"],
+                "role": r["role"],
+                "content": r["content"],
+                "message_type": r.get("message_type") or "text",
+                "client_id": r.get("client_id"),
+                "duration_ms": r.get("duration_ms"),
+                "created_at": r["created_at"].strftime("%Y-%m-%d %H:%M:%S") if r["created_at"] else None,
+            }
+            if item["message_type"] == "image":
+                # ⭐ 带 HMAC 签名，防枚举
+                sig = sign(r["id"])
+                item["image_url"] = f"/agent/v1/image/{r['id']}?sig={sig}"
+                if r.get("thumb_filename"):
+                    item["thumb_url"] = f"/agent/v1/thumb/{r['id']}?sig={sig}"
+            outputs = r.get("outputs")
+            if isinstance(outputs, str):
+                try:
+                    outputs = json.loads(outputs)
+                except Exception:
+                    outputs = None
+            if outputs:
+                item["outputs"] = outputs
+            result.append(item)
+
+        logger.info(f"[Repo] get_all_messages session={session_id}, {len(result)} 条")
+        return result
 
     def exists(self, session_id: str) -> bool:
         row = self.query_one(
@@ -87,41 +130,55 @@ class ConversationRepoImpl(BaseRepo, ConversationRepository):
         rows.reverse()
         return [{"role": r["role"], "content": r["content"]} for r in rows]
 
-    def get_all_messages(self, session_id, user_id=None):
-        rows = self.query_list(
-            "SELECT id, role, content, message_type, outputs, "
-            "image_filename, thumb_filename, client_id, duration_ms, created_at "
-            "FROM agent_message WHERE session_id=%s ORDER BY id ASC",
-            (session_id,),
+    def exists_for_user(self, session_id: str, user_id) -> bool:
+        if not user_id:
+            return False
+        row = self.query_one(
+            "SELECT 1 FROM agent_conversation "
+            "WHERE session_id=%s AND user_id=%s LIMIT 1",
+            (session_id, user_id),
         )
-        result = []
-        for r in rows:
-            item = {
-                "id": r["id"],
-                "role": r["role"],
-                "content": r["content"],
-                "message_type": r.get("message_type") or "text",
-                "client_id": r.get("client_id"),
-                "duration_ms": r.get("duration_ms"),
-                "created_at": r["created_at"].strftime("%Y-%m-%d %H:%M:%S") if r["created_at"] else None,
-            }
-            if item["message_type"] == "image":
-                item["image_url"] = f"/agent/v1/image/{r['id']}"
-                if r.get("thumb_filename"):
-                    item["thumb_url"] = f"/agent/v1/thumb/{r['id']}"
-            # outputs 解析
-            outputs = r.get("outputs")
-            if isinstance(outputs, str):
-                try:
-                    outputs = json.loads(outputs)
-                except Exception:
-                    outputs = None
-            if outputs:
-                item["outputs"] = outputs
-            result.append(item)
+        return row is not None
 
-        logger.info(f"[Repo] get_all_messages session={session_id}, {len(result)} 条")
-        return result
+    # def get_all_messages(self, session_id, user_id=None):
+    #     if not user_id:
+    #         return []
+    #     rows = self.query_list(
+    #         "SELECT m.id, m.role, m.content, m.message_type, m.outputs, "
+    #         "m.image_filename, m.thumb_filename, m.client_id, m.duration_ms, m.created_at "
+    #         "FROM agent_message m "
+    #         "JOIN agent_conversation c ON m.session_id = c.session_id "
+    #         "WHERE m.session_id=%s AND c.user_id=%s "
+    #         "ORDER BY m.id ASC",
+    #         (session_id, user_id),
+    #     )
+    #     result = []
+    #     for r in rows:
+    #         item = {
+    #             "id": r["id"],
+    #             "role": r["role"],
+    #             "content": r["content"],
+    #             "message_type": r.get("message_type") or "text",
+    #             "client_id": r.get("client_id"),
+    #             "duration_ms": r.get("duration_ms"),
+    #             "created_at": r["created_at"].strftime("%Y-%m-%d %H:%M:%S") if r["created_at"] else None,
+    #         }
+    #         if item["message_type"] == "image":
+    #             item["image_url"] = f"/agent/v1/image/{r['id']}"
+    #             if r.get("thumb_filename"):
+    #                 item["thumb_url"] = f"/agent/v1/thumb/{r['id']}"
+    #         outputs = r.get("outputs")
+    #         if isinstance(outputs, str):
+    #             try:
+    #                 outputs = json.loads(outputs)
+    #             except Exception:
+    #                 outputs = None
+    #         if outputs:
+    #             item["outputs"] = outputs
+    #         result.append(item)
+    #
+    #     logger.info(f"[Repo] get_all_messages session={session_id}, {len(result)} 条")
+    #     return result
 
     def message_count(self, session_id: str) -> int:
         row = self.query_one(

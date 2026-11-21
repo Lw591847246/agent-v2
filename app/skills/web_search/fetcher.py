@@ -1,18 +1,24 @@
-﻿# app/application/skills/search_skill/fetcher.py
-"""
-网页正文抓取：
-  - 并发抓取（默认 3 个 URL）
-  - 正文提取（trafilatura 优先，BeautifulSoup 兜底）
-  - 进程内 LRU 缓存（1 小时）
-  - 熔断保护（连续失败 5 次暂停 5 分钟）
-  - 黑名单域名（视频/PDF/百科，避免垃圾内容）
+﻿"""网页正文抓取。
+
+本版加固（架构复核 P0-2）
+------------------------
+原来只做 `urlparse` + 域名黑名单，**不判断目标 IP**：一条搜索结果就能让 agent
+去访问 `http://erp-internal:8080`、`http://192.168.1.10/api`，把内网服务探一遍。
+现在：
+
+1. 每个候选 URL 先过 `utils/net_guard.check_url()`（主机名 + DNS 解析结果都检查）；
+2. **禁用 httpx 自动重定向**，改为手动跟随（最多 `max_redirects` 跳），
+   每一跳都重新校验 —— 否则 302 到内网就能绕过；
+3. 可用 `services.search.fetcher.block_private_ips=false` 关闭（不建议）。
+
+保留原有能力：并发抓取、trafilatura 正文提取、bs4 兜底、LRU 缓存、熔断、黑名单。
 """
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -25,6 +31,7 @@ except ImportError:
 
 from app.config.loader import config
 from app.core.logger import logger
+from app.utils.net_guard import check_url
 
 
 # ============================================================
@@ -41,6 +48,8 @@ _MAX_CONCURRENT = int(_cfg("max_concurrent", 3))
 _CACHE_TTL = int(_cfg("cache_ttl", 3600))
 _CIRCUIT_THRESHOLD = int(_cfg("circuit_threshold", 5))
 _CIRCUIT_COOLDOWN = int(_cfg("circuit_cooldown", 300))
+_BLOCK_PRIVATE_IPS = bool(_cfg("block_private_ips", True))
+_MAX_REDIRECTS = int(_cfg("max_redirects", 3))
 
 
 # ============================================================
@@ -98,22 +107,33 @@ _BLACKLIST_DOMAINS = (
 _SKIP_EXTENSIONS = (".pdf", ".zip", ".rar", ".mp4", ".mp3", ".jpg", ".png", ".gif", ".webp", ".exe")
 
 
-def _should_fetch(url: str) -> bool:
-    """判断 URL 是否值得抓取"""
+def _url_allowed(url: str) -> tuple:
+    """域名黑名单 + 私网/SSRF 校验。返回 (ok, reason)。"""
     if not url or not url.startswith("http"):
-        return False
+        return False, "scheme"
     try:
         parsed = urlparse(url)
-        domain = parsed.netloc.lower()
-        path = parsed.path.lower()
-
-        if any(d in domain for d in _BLACKLIST_DOMAINS):
-            return False
-        if path.endswith(_SKIP_EXTENSIONS):
-            return False
-        return True
     except Exception:
-        return False
+        return False, "bad_url"
+
+    domain = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+
+    if any(d in domain for d in _BLACKLIST_DOMAINS):
+        return False, "blacklist"
+    if path.endswith(_SKIP_EXTENSIONS):
+        return False, "ext"
+
+    if _BLOCK_PRIVATE_IPS:
+        ok, reason = check_url(url)
+        if not ok:
+            return False, reason
+    return True, ""
+
+
+def _should_fetch(url: str) -> bool:
+    """判断 URL 是否值得抓取"""
+    return _url_allowed(url)[0]
 
 
 # ============================================================
@@ -127,9 +147,9 @@ def _extract_with_trafilatura(html: str, url: str) -> str:
         content = trafilatura.extract(
             html,
             include_comments=False,
-            include_tables=True,       # 保留表格（天气页可能有表格）
+            include_tables=True,
             include_images=False,
-            favor_recall=True,         # 优先召回（宁可多不可少）
+            favor_recall=True,
             url=url,
         )
         return (content or "").strip()
@@ -142,11 +162,9 @@ def _extract_with_bs4(html: str) -> str:
     """BeautifulSoup 启发式兜底"""
     try:
         soup = BeautifulSoup(html, "html.parser")
-        # 移除噪音标签
         for tag in soup(["script", "style", "nav", "header", "footer", "aside", "form", "iframe"]):
             tag.decompose()
 
-        # 优先找语义化容器
         for selector in ("article", "main", "[role=main]", ".article-content", ".post-content", ".content", "#content"):
             node = soup.select_one(selector)
             if node:
@@ -154,7 +172,6 @@ def _extract_with_bs4(html: str) -> str:
                 if len(text) > 100:
                     return text
 
-        # 兜底：body 全文
         body = soup.find("body")
         if body:
             return body.get_text(separator="\n", strip=True)
@@ -179,7 +196,6 @@ def _extract_title(html: str) -> str:
         t = soup.find("title")
         if t:
             return t.get_text(strip=True)[:200]
-        # 兜底：og:title
         og = soup.find("meta", property="og:title")
         if og and og.get("content"):
             return og["content"][:200]
@@ -194,10 +210,8 @@ def _clean_text(text: str, max_chars: int) -> str:
         return ""
 
     lines = [line.strip() for line in text.split("\n")]
-    # 去空行和极短行
     lines = [line for line in lines if line and len(line) > 2]
 
-    # 相邻行去重
     deduped = []
     for line in lines:
         if not deduped or deduped[-1] != line:
@@ -213,12 +227,30 @@ def _clean_text(text: str, max_chars: int) -> str:
 # ============================================================
 # 单 URL 抓取
 # ============================================================
+def _get_following_redirects(client: httpx.Client, url: str) -> httpx.Response:
+    """手动跟随重定向，每一跳都重新做 SSRF 校验。"""
+    current = url
+    for hop in range(_MAX_REDIRECTS + 1):
+        ok, reason = _url_allowed(current)
+        if not ok:
+            raise httpx.ConnectError(f"blocked_url:{reason}")
+        r = client.get(current)
+        if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
+            nxt = urljoin(current, r.headers["location"])
+            logger.debug(f"[Fetcher] 重定向 {current} -> {nxt}")
+            current = nxt
+            continue
+        return r
+    raise httpx.TooManyRedirects(f">{_MAX_REDIRECTS} redirects")
+
+
 def fetch_one(url: str, max_chars: int = _MAX_CHARS_PER_URL) -> Dict:
     """抓取单个 URL，返回 {url, title, content, success, reason}"""
-    if not _should_fetch(url):
-        return {"url": url, "title": "", "content": "", "success": False, "reason": "skip"}
+    ok, reason = _url_allowed(url)
+    if not ok:
+        logger.info(f"[Fetcher] 拒绝抓取 {url} ({reason})")
+        return {"url": url, "title": "", "content": "", "success": False, "reason": f"skip:{reason}"}
 
-    # 查缓存
     with _cache_lock:
         cached = _fetch_cache.get(url)
         if cached and time.time() - cached[1] < _CACHE_TTL:
@@ -232,14 +264,13 @@ def fetch_one(url: str, max_chars: int = _MAX_CHARS_PER_URL) -> Dict:
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             },
-            follow_redirects=True,
+            follow_redirects=False,          # ⭐ 手动跟随，保证每跳都校验
         ) as c:
-            r = c.get(url)
+            r = _get_following_redirects(c, url)
 
         if r.status_code != 200:
             return {"url": url, "title": "", "content": "", "success": False, "reason": f"http_{r.status_code}"}
 
-        # 编码处理（httpx 已自动处理，但某些站点会乱码，保险起见）
         html = r.text
         if not html or len(html) < 200:
             return {"url": url, "title": "", "content": "", "success": False, "reason": "empty_html"}
@@ -258,8 +289,11 @@ def fetch_one(url: str, max_chars: int = _MAX_CHARS_PER_URL) -> Dict:
 
     except httpx.TimeoutException:
         return {"url": url, "title": "", "content": "", "success": False, "reason": "timeout"}
-    except httpx.ConnectError:
-        return {"url": url, "title": "", "content": "", "success": False, "reason": "connect_error"}
+    except httpx.TooManyRedirects:
+        return {"url": url, "title": "", "content": "", "success": False, "reason": "too_many_redirects"}
+    except httpx.ConnectError as e:
+        # blocked_url 也走这里（内部抛出 ConnectError 包装）
+        return {"url": url, "title": "", "content": "", "success": False, "reason": str(e)[:100]}
     except Exception as e:
         return {"url": url, "title": "", "content": "", "success": False, "reason": str(e)[:100]}
 
@@ -268,10 +302,7 @@ def fetch_one(url: str, max_chars: int = _MAX_CHARS_PER_URL) -> Dict:
 # 批量抓取
 # ============================================================
 def fetch_batch(urls: List[str], max_urls: int = None) -> List[Dict]:
-    """
-    并发抓取多个 URL 的正文。
-    返回成功抓到的结果列表（可能少于 max_urls）。
-    """
+    """并发抓取多个 URL 的正文。返回成功抓到的结果列表。"""
     if not urls:
         return []
 
@@ -282,7 +313,6 @@ def fetch_batch(urls: List[str], max_urls: int = None) -> List[Dict]:
         logger.info("[Fetcher] 熔断中，跳过抓取")
         return []
 
-    # 过滤 + 截断
     valid_urls = []
     for u in urls:
         if _should_fetch(u) and u not in valid_urls:
@@ -313,7 +343,6 @@ def fetch_batch(urls: List[str], max_urls: int = None) -> List[Dict]:
     except Exception as e:
         logger.warning(f"[Fetcher] 并发抓取异常: {e}")
 
-    # 全部失败 → 记一次熔断
     if results:
         _circuit_record(True)
     else:

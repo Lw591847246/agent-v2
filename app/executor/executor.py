@@ -11,6 +11,8 @@ from app.contracts.result import Result, StreamResult, error_part
 from app.contracts.skill import BaseSkill
 from app.core.logger import logger
 
+from contextlib import nullcontext as _nullctx
+
 
 class Executor:
 
@@ -47,9 +49,20 @@ class Executor:
             logger.exception(f"[Executor] {skill.name} 执行崩溃: {e}")
             return Result(parts=[error_part("执行失败")])
 
+    # app/executor/executor.py 中：
     def run_action(self, skill: BaseSkill, action: ActionRequest) -> Result:
+        from app.core.gpu_lock import GPUResource, gpu_lock, _map_task_name
         try:
-            return skill.on_action(action)
+            # skill.name → GPUResource；未知的 skill 不加锁（纯文本类）
+            resource = None
+            try:
+                resource = _map_task_name(skill.name)
+            except ValueError:
+                resource = None
+            ctx = gpu_lock.lease(resource, task=f"action:{skill.name}", timeout=600) \
+                if resource else _nullctx()
+            with ctx:
+                return skill.on_action(action)
         except NotImplementedError:
             return Result(parts=[error_part("该操作不支持")])
         except SkillError as e:

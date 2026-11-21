@@ -1,4 +1,14 @@
-"""会话服务。"""
+"""会话服务。
+
+本轮修复（越权写入 P0-1）新增会话准入三件套：
+    is_owned / assert_owned / resolve_session
+所有 "客户端传入 session_id" 的入口都必须先过 resolve_session：
+    不存在 -> 幂等创建；存在但非本人 -> NotFoundException（不暴露存在性）。
+
+注意：ensure_conversation 的旧语义是"不属于我就 create"，在无唯一约束的表上
+会插入第二条归属记录、反而让攻击者能读到他人历史消息；现已收紧为
+resolve_session 的别名。
+"""
 import os
 import re
 import threading
@@ -18,12 +28,12 @@ from app.core.llm_tracker import track_llm
 
 _summary_locks: Dict[str, threading.Lock] = {}
 
+# session_id 会被下游 skill 直接当目录名用（data/videos/<uid>/<sid> 等），
+# 因此只允许安全字符；uuid4().hex 与前端自生成的 id 都满足。
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
 # ============================================================
-# 有界后台执行器：收编原先的两处裸线程（标题优化 / 摘要生成）
-#   - worker 数固定，活跃后台线程恒定不超过 _BG_MAX_WORKERS；
-#   - 提交侧信号量限排队，超额 best-effort 丢弃（标题有本地规则兜底、
-#     摘要下一轮会补，丢弃无副作用）；
-#   - 避免每个请求裸起 daemon 线程抽干 DB 连接池与 Ollama。
+# 有界后台执行器
 # ============================================================
 _BG_MAX_WORKERS = int(os.getenv("CONV_BG_MAX_WORKERS", "2"))
 _BG_QUEUE_CAP = int(os.getenv("CONV_BG_QUEUE_CAP", "16"))
@@ -32,7 +42,6 @@ _bg_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=_BG_MAX_WORKERS,
     thread_name_prefix="conv-bg",
 )
-# 容量 = 同时在跑的 worker + 允许排队的任务数
 _bg_sem = threading.BoundedSemaphore(_BG_MAX_WORKERS + _BG_QUEUE_CAP)
 
 
@@ -40,7 +49,8 @@ def submit_bg(task_label: str, fn, *args) -> bool:
     """把 best-effort 后台任务提交到有界执行器。
 
     返回是否成功提交；闸满立即返回 False，不阻塞调用方（Web 线程）。
-    通过 contextvars.copy_context 把 trace_id 等上下文透传进 worker 线程。
+    通过 contextvars.copy_context 把 trace_id 等上下文透传进 worker 线程，
+    并显式恢复 OTel context（使后台 span 挂到发起请求的 trace 下）。
     """
     if not _bg_sem.acquire(blocking=False):
         logger.warning(
@@ -48,20 +58,29 @@ def submit_bg(task_label: str, fn, *args) -> bool:
         )
         return False
 
+    ctx = contextvars.copy_context()
+    try:
+        from app.core.tracing import capture_context, run_in_context
+        _otel_ctx = capture_context()
+    except Exception:
+        _otel_ctx = None
+        run_in_context = None
+
     def _runner():
         try:
-            fn(*args)
+            if run_in_context is not None and _otel_ctx is not None:
+                run_in_context(_otel_ctx, fn, *args)
+            else:
+                fn(*args)
         finally:
             _bg_sem.release()
 
-    ctx = contextvars.copy_context()
     try:
         _bg_executor.submit(ctx.run, _runner)
     except Exception:
-        # submit 失败（如执行器已关闭）必须归还信号量，避免漏放
         _bg_sem.release()
-        logger.warning(f"关闭期丢弃")
-        return  False
+        logger.warning(f"关闭期丢弃 label={task_label}")
+        return False
     return True
 
 
@@ -100,30 +119,98 @@ class ConversationService:
         self._repo: ConversationRepository = conversation_repo
 
     # ============================================================
-    # 会话
+    # 用户 ID 类型归一（不做 DDL 迁移）
+    # ============================================================
+    # 现状：Redis 里的 userId 是字符串，各 controller 又各自 int()，
+    #       DB 列类型未知（INT 或 VARCHAR 都有可能）。
+    # 结论：不做表结构迁移（收益小、涉及历史数据与前端），只在仓储边界统一成 str：
+    #   - 列是 INT    -> WHERE user_id='123'，MySQL 把常量转成 int，索引照常命中；
+    #   - 列是 VARCHAR -> 精确匹配，索引照常命中。
+    # 反之传 int 时若列是 VARCHAR，列会被转成 double 比较，索引失效。
+    @staticmethod
+    def _db_uid(user_id) -> str:
+        return str(int(user_id))
+
+    # ============================================================
+    # 会话归属（安全准入）
     # ============================================================
 
-    def ensure_conversation(self, session_id: str, user_id: str):
-        if not self._repo.exists(session_id):
-            self._repo.create(session_id, user_id)
+    def is_owned(self, session_id: str, user_id) -> bool:
+        """会话是否属于该用户；空/非法一律 False。"""
+        if not session_id or not user_id:
+            return False
+        try:
+            return bool(self._repo.exists_for_user(session_id, self._db_uid(user_id)))
+        except Exception as e:
+            logger.warning(f"[会话] 归属查询失败 sid={session_id}: {e}")
+            return False
+
+    def assert_owned(self, session_id: str, user_id) -> str:
+        """不属于该用户 -> NotFoundException（与 messages() 保持同一语义）。"""
+        if not self.is_owned(session_id, user_id):
+            logger.warning(
+                f"[会话] 归属校验拒绝 sid={session_id} req_user={user_id}"
+            )
+            raise NotFoundException("会话不存在")
+        return session_id
+
+    def resolve_session(self, session_id: Optional[str], user_id) -> str:
+        """HTTP 入口唯一准入。
+
+        前提：会话只由后端创建（POST /agent/v1/conversation/new），前端只用返回值。
+        因此**不再"不存在就创建"**：
+        - 空 session_id            → 新建（兼容"首条消息不带 session"的老前端）
+        - 格式非法(含 / \\ .. 空格) → 404 —— session_id 会被下游 skill 当目录名用
+        - 不存在                   → 404（避免"认领"已删/他人话题的残留消息）
+        - 存在但 owner != 当前用户 → 404
+        - 存在且属于本人           → 复用（同一话题后续消息都走这条）
+
+        若将来前端改成自造 session_id，把这里换成 "不存在则 create" 即可（见 git 历史）。
+        """
+        uid = int(user_id)
+        sid = (session_id or "").strip()
+        if not sid:
+            return self.new_conversation(uid)
+
+        if not _SESSION_ID_RE.match(sid):
+            logger.warning(f"[会话] 非法 session_id 被拒绝: {sid!r} req_user={uid}")
+            raise NotFoundException("会话不存在")
+
+        if not self._repo.exists_for_user(sid, self._db_uid(uid)):
+            logger.warning(f"[会话] 归属校验拒绝 sid={sid} req_user={uid}")
+            raise NotFoundException("会话不存在")
+        return sid
+
+    def ensure_conversation(self, session_id: str, user_id) -> str:
+        """兼容旧调用；语义已收紧为 resolve_session（不再"不属于我就 create"）。"""
+        return self.resolve_session(session_id, user_id)
+
+    # ============================================================
+    # 会话
+    # ============================================================
 
     def exists_user_message_by_client_id(self, session_id: str, client_id: str) -> bool:
         return self._repo.exists_user_message_by_client_id(session_id, client_id)
 
-    def new_conversation(self, user_id: str) -> str:
+    def new_conversation(self, user_id) -> str:
         session_id = uuid.uuid4().hex
-        self._repo.create(session_id, user_id)
+        self._repo.create(session_id, self._db_uid(user_id))
         return session_id
 
-    def list(self, user_id: str) -> List[dict]:
-        return self._repo.list_by_user(user_id)
+    def list(self, user_id) -> List[dict]:
+        return self._repo.list_by_user(self._db_uid(user_id))
 
-    def messages(self, session_id: str, user_id: str = None) -> dict:
-        if not self._repo.exists(session_id):
+    def messages(self, session_id: str, user_id=None) -> dict:
+        """读取会话消息：必须按 user_id 校验归属，拒绝越权访问。
+
+        - 会话不存在 / 不属于该 user_id：统一抛 NotFoundException（避免暴露"存在但无权限"）
+        - repo 层再做一次 user_id 过滤（SQL 双保险）
+        """
+        if not user_id or not self._repo.exists_for_user(session_id, self._db_uid(user_id)):
             raise NotFoundException("会话不存在")
         return {
             "session_id": session_id,
-            "messages": self._repo.get_all_messages(session_id, user_id),
+            "messages": self._repo.get_all_messages(session_id, self._db_uid(user_id)),
         }
 
     def save_message(
@@ -150,7 +237,7 @@ class ConversationService:
             duration_ms=duration_ms,
         )
 
-    def get_history(self, session_id: str, user_id: str = None) -> List[dict]:
+    def get_history(self, session_id: str, user_id=None) -> List[dict]:
         raw_history = self._repo.get_messages(session_id)
         result = []
         for m in raw_history:
@@ -171,9 +258,6 @@ class ConversationService:
         title = self._rule_based_title(text)
         self._repo.update_title(session_id, title)
         logger.info(f"【标题】本地规则生成: {title}")
-
-        # 原裸线程 -> 有界后台执行器：标题优化 best-effort，闸满直接丢弃，
-        # 本地规则标题已先落库，丢弃不影响用户可见结果。
         submit_bg("title-opt", self._async_optimize_title, session_id, text)
 
     def _async_optimize_title(self, session_id: str, text: str):
@@ -182,7 +266,6 @@ class ConversationService:
                 f"请为以下对话生成一个不超过 12 个字的简短标题，"
                 f"只输出标题文字，不要标点、不要引号、不要解释：\n\n{text}"
             )
-            # 标题优化是后台任务，独立抢锁；短任务超时 60s
             with gpu_lock.lease(GPUResource.OLLAMA_CHAT, task="title-opt", timeout=60):
                 result = ollama_client.chat(
                     service="intent", model_key="intent",
@@ -331,7 +414,6 @@ class ConversationService:
             self._do_generate_summary(session_id)
             return
 
-        # per-session 锁：同一会话已有摘要在跑就直接跳过（保留原语义）。
         lock = _summary_locks.setdefault(session_id, threading.Lock())
         if not lock.acquire(blocking=False):
             return
@@ -342,9 +424,6 @@ class ConversationService:
             finally:
                 lock.release()
 
-        # 原裸线程 -> 有界后台执行器。
-        # 关键：per-session 锁在提交前已持有，若提交失败（闸满/执行器关闭）
-        # 必须在此处释放，否则该 session 的锁永久泄漏、后续摘要全被卡死。
         try:
             submitted = submit_bg("summary", _run)
         except Exception:
@@ -402,7 +481,6 @@ class ConversationService:
         )
 
         try:
-            # 摘要是后台长 LLM 调用，独立抢锁；超时 180s
             with gpu_lock.lease(GPUResource.OLLAMA_CHAT, task="summary", timeout=180):
                 result = ollama_client.chat(
                     service=svc, model_key=mkey,

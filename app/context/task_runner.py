@@ -1,18 +1,31 @@
 """异步任务统一入口：create / progress / finish / fail / outputs 落库。
 
-V2 加固：
+V2 加固（保留）：
 - BoundedSemaphore 并发闸：物理掐断内存/DB 连接池/GPU 排队峰值
 - submit 非阻塞：闸满直接拒绝，不拖住 web 线程
 - trace_id / session_id / user_id 显式透传：threading.Thread 不继承 contextvar
+
+本轮新增（架构复核 P0-4）：
+1. **每用户并发配额**：单用户同时运行 ≤ `task.max_per_user`（默认 2），
+   防止一个人占满全局闸、把别人饿死；被拒时抛 RuntimeError（业务码统一处理）。
+2. **指标埋点**：`agent_task_running`、`agent_task_rejected_total{reason}`、
+   `agent_task_finished_total{status}`、`agent_task_queue_seconds{sum,count}`。
+   其中 queue_seconds = submit → 第一次 progress 的间隔，近似"排队+预热"耗时。
+3. 名额占用/释放收敛到 `_acquire_slot` / `_release_slot` 两个方法，
+   避免"抢到闸但建任务行失败"时漏放（原来靠散落的 try/except）。
 """
 from __future__ import annotations
 
 import json
 import os
 import threading
+import time
 import uuid
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional
 
+from app.config.loader import config
+from app.contracts.errors import SkillError
+from app.core import metrics
 from app.core.context import RequestContext
 from app.core.logger import logger
 from app.core.tracing import (
@@ -23,58 +36,111 @@ from app.infrastructure.repositories.task_repo import task_repo
 
 
 class TaskRunner:
-    def __init__(self, max_concurrent: Optional[int] = None):
-        # 默认 3，可用环境变量 TASK_MAX_CONCURRENT 调（按内存调整）
-        n = max_concurrent or int(os.getenv("TASK_MAX_CONCURRENT", "3"))
-        n = max(1, n)
-        self._max_concurrent = n
-        # BoundedSemaphore：误多 release 会抛 ValueError，防止闸被悄悄放大
-        self._sem = threading.BoundedSemaphore(n)
-        self._running = 0
-        self._running_lock = threading.Lock()
+    def __init__(self, max_concurrent: Optional[int] = None,
+                 max_per_user: Optional[int] = None):
+        # 优先构造参数 > 环境变量 > yml(task.*) > 默认
+        n = (max_concurrent
+             or int(os.getenv("TASK_MAX_CONCURRENT", "0") or 0)
+             or int(config.get("task.max_concurrent", 3) or 3))
+        self._max_concurrent = max(1, n)
 
+        m = (max_per_user
+             or int(os.getenv("TASK_MAX_PER_USER", "0") or 0)
+             or int(config.get("task.max_per_user", 2) or 2))
+        self._max_per_user = max(1, m)
+
+        # BoundedSemaphore：误多 release 会抛 ValueError，防止闸被悄悄放大
+        self._sem = threading.BoundedSemaphore(self._max_concurrent)
+        self._running = 0
+        self._user_running: Dict[str, int] = {}
+        self._lock = threading.Lock()
+        self._submit_ts: Dict[str, float] = {}
+        self._first_progress: Dict[str, bool] = {}
+
+    # ============================================================
+    # 名额（全局闸 + 每用户配额）统一管理
+    # ============================================================
+    def _acquire_slot(self, user_key: str, skill_name: str, session_id: str) -> int:
+        """抢全局闸 + 用户配额。返回当前运行数；失败抛 RuntimeError。"""
+        if not self._sem.acquire(blocking=False):
+            metrics.inc("agent_task_rejected_total", {"reason": "global"})
+            logger.warning(
+                f"[TaskRunner] 全局并发已达上限({self._max_concurrent})，拒绝入队 "
+                f"skill={skill_name} session={session_id}"
+            )
+            raise SkillError("系统繁忙，后台任务已达并发上限，请稍后重试", code=429)
+
+        with self._lock:
+            cur_user = self._user_running.get(user_key, 0)
+            if cur_user >= self._max_per_user:
+                self._sem.release()  # 立刻还回全局闸
+                metrics.inc("agent_task_rejected_total", {"reason": "per_user"})
+                logger.warning(
+                    f"[TaskRunner] 用户并发已达上限({self._max_per_user})，拒绝入队 "
+                    f"user={user_key} skill={skill_name}"
+                )
+                raise SkillError(
+                    f"你还有 {cur_user} 个任务在运行，最多同时 {self._max_per_user} 个，请稍后重试",
+                    code=429,
+                )
+            self._user_running[user_key] = cur_user + 1
+            self._running += 1
+            running = self._running
+
+        metrics.set_gauge("agent_task_running", running)
+        return running
+
+    def _release_slot(self, user_key: str) -> None:
+        with self._lock:
+            cur = self._user_running.get(user_key, 0)
+            if cur <= 1:
+                self._user_running.pop(user_key, None)
+            else:
+                self._user_running[user_key] = cur - 1
+            self._running = max(0, self._running - 1)
+            running = self._running
+        try:
+            self._sem.release()
+        except ValueError:
+            logger.warning("[TaskRunner] 信号量重复释放（已忽略）")
+        metrics.set_gauge("agent_task_running", running)
+
+    # ============================================================
+    # 提交
+    # ============================================================
     def submit(
         self, skill_name: str, session_id: str, user_id: int,
         slots: dict, fn: Callable[[str], None],
         provider: str = "local",
     ) -> str:
-        # 非阻塞抢闸：满了直接拒绝，绝不在 web 线程里 acquire 阻塞
-        if not self._sem.acquire(blocking=False):
-            logger.warning(
-                f"[TaskRunner] 并发已达上限({self._max_concurrent})，拒绝入队 "
-                f"skill={skill_name} session={session_id}"
-            )
-            raise RuntimeError("系统繁忙，后台任务已达并发上限，请稍后重试")
+        user_key = str(user_id)
+        running = self._acquire_slot(user_key, skill_name, session_id)
 
-        # 抢到闸后，下面任何一步失败都要把闸放回去，否则信号量漏放会越跑越小
+        # 抢到名额后，下面任何一步失败都要还回去，否则名额会越跑越少
         try:
             task_id = f"{skill_name}_{uuid.uuid4().hex[:10]}"
             task_repo.create_task(
                 task_id=task_id, session_id=session_id, user_id=user_id,
                 skill_name=skill_name, slots=slots or {}, provider=provider,
             )
+            self._submit_ts[task_id] = time.time()
+            self._first_progress[task_id] = False
         except Exception:
-            self._sem.release()
+            self._release_slot(user_key)
             raise
 
         # threading.Thread 不继承 contextvar：主线程先取出来，传进子线程再 set
         trace_id = RequestContext.get_trace_id()
-        # ⭐ 链路追踪：捕获发起请求的 OTel 上下文快照（含当前 HTTP/业务 span）。
-        #    OTel 的 current-span 同样是 contextvar，子线程不会自动继承，必须显式
-        #    capture->attach，后台任务的 span 才能挂在发起它的请求 trace 下，
-        #    在 Jaeger 里看到 "HTTP 请求 -> 异步任务 -> ComfyUI 调用" 一条完整链。
         otel_ctx = capture_context()
         threading.Thread(
             target=self._run,
-            args=(task_id, fn, trace_id, session_id, str(user_id), provider, otel_ctx),
+            args=(task_id, fn, trace_id, session_id, user_key, provider, otel_ctx),
             daemon=True,
         ).start()
 
-        with self._running_lock:
-            self._running += 1
-            cur = self._running
         logger.info(
-            f"[TaskRunner] submitted task_id={task_id} skill={skill_name} running={cur}"
+            f"[TaskRunner] submitted task_id={task_id} skill={skill_name} "
+            f"user={user_key} running={running}"
         )
         return task_id
 
@@ -89,8 +155,6 @@ class TaskRunner:
         RequestContext.set_user_id(user_id)
         RequestContext.set_extra_fields(task_type=task_id.split("_", 1)[0])
 
-        # ⭐ 链路追踪：把父请求的 OTel 上下文 attach 到本线程，使 task 级 span
-        #    自动成为发起请求 span 的子 span（OTel 未启用时全部安全空转）。
         token = attach_context(otel_ctx)
         tracer = get_tracer("task_runner")
         sp = tracer.start_span(
@@ -100,7 +164,7 @@ class TaskRunner:
                 "task.skill": task_id.split("_", 1)[0],
                 "task.provider": provider,
                 "session.id": session_id,
-                "app.trace_id": trace_id,  # 与日志 trace_id 交叉印证
+                "app.trace_id": trace_id,
             },
         )
         try:
@@ -125,12 +189,25 @@ class TaskRunner:
             except Exception:
                 pass
             detach_context(token)
-            with self._running_lock:
-                self._running -= 1
-            self._sem.release()
+            self._submit_ts.pop(task_id, None)
+            self._first_progress.pop(task_id, None)
+            self._release_slot(user_id)
             RequestContext.clear_extra_fields()
 
-    def progress(self, task_id: str, pct: int, msg: Optional[str] = None, steps: Optional[list] = None) -> None:
+    # ============================================================
+    # 进度 / 完成 / 失败
+    # ============================================================
+    def progress(self, task_id: str, pct: int, msg: Optional[str] = None,
+                 steps: Optional[list] = None) -> None:
+        # 首次 progress ≈ 已排到队/抢到 GPU，用来度量排队耗时
+        try:
+            if self._first_progress.get(task_id) is False:
+                self._first_progress[task_id] = True
+                ts = self._submit_ts.get(task_id)
+                if ts:
+                    metrics.observe("agent_task_queue_seconds", time.time() - ts)
+        except Exception:
+            pass
         try:
             task_repo.update_progress(task_id, pct, msg, steps=steps)
         except Exception as e:
@@ -180,6 +257,7 @@ class TaskRunner:
                 task_id, parts=parts, duration_ms=duration_ms,
                 output_path=output_path, outputs=outputs,
             )
+            metrics.inc("agent_task_finished_total", {"status": "done"})
             logger.info(f"[TaskRunner] finish 任务状态已更新为 done task_id={task_id}")
         except Exception as e:
             logger.error(f"[TaskRunner] finish task failed {task_id}: {e}")
@@ -187,6 +265,7 @@ class TaskRunner:
     def fail(self, task_id: str, error: str, session_id: Optional[str] = None) -> None:
         try:
             task_repo.fail(task_id, error)
+            metrics.inc("agent_task_finished_total", {"status": "failed"})
         except Exception as e:
             logger.warning(f"[TaskRunner] fail task failed {task_id}: {e}")
 
@@ -205,7 +284,6 @@ class TaskRunner:
                 logger.warning(f"[TaskRunner] fail 找不到 msg_id task_id={task_id}")
                 return
 
-            # ⭐ 统一失败格式：error 卡片 + 兜底 text
             error_full = error or "未知错误"
             error_short = error_full[:500]
 
@@ -242,9 +320,22 @@ class TaskRunner:
     def cancel(self, task_id: str) -> None:
         try:
             task_repo.update(task_id, status="canceled", progress=0)
+            metrics.inc("agent_task_finished_total", {"status": "canceled"})
             logger.info(f"[TaskRunner] canceled task_id={task_id}")
         except Exception as e:
             logger.warning(f"[TaskRunner] cancel failed: {e}")
+
+    # ============================================================
+    # 运维视图
+    # ============================================================
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                "running": self._running,
+                "max_concurrent": self._max_concurrent,
+                "max_per_user": self._max_per_user,
+                "users": dict(self._user_running),
+            }
 
     @staticmethod
     def _infer_type(parts: list) -> str:
@@ -263,4 +354,3 @@ class TaskRunner:
 
 
 task_runner = TaskRunner()
-

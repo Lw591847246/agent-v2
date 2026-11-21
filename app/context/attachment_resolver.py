@@ -1,11 +1,14 @@
-# app/context/attachment_resolver.py
-"""附件解析：file_id / base64 两种来源 → Attachment 列表。"""
+"""附件解析：file_id / base64 两种来源 → Attachment 列表。
+
+本轮改动：缩略图 URL 走签名（upload/thumb 已补鉴权，未签名的裸 URL 会被拒）。
+"""
 from __future__ import annotations
 
 from typing import List
 
 from app.core.logger import logger
 from app.models.attachment import Attachment
+from app.utils.signed_url import thumb_url as signed_thumb_url
 
 
 class AttachmentResolver:
@@ -35,8 +38,7 @@ class AttachmentResolver:
                     path=meta.get("path", ""),
                     base64="",
                     thumb_url=(
-                        f"/agent/v1/upload/thumb/{fid}"
-                        if meta.get("thumb_path") else ""
+                        signed_thumb_url(fid) if meta.get("thumb_path") else ""
                     ),
                     size=meta.get("size", 0),
                     duration=meta.get("duration") or 0.0,

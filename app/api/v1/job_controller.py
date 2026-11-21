@@ -2,25 +2,34 @@
 
 ⚠️ 本文件不做 GPU 锁 —— 只读 task 状态和磁盘文件，
    GPU 串行的加锁点在媒体任务提交侧（comfyui_client / liveportrait 提交处）。
+
+修复（P0-2）：
+- `/job/{task_id}`：需登录 + 任务归属（原实现任何人可读他人进度与产物清单）；
+- `/job/{task_id}/video`：走 download_router，签名有效 或 登录态+任务归属
+  （<video src> 带不了 Authorization 头，必须支持签名 URL）。
 """
 import os
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
+from app.api.deps import (
+    CurrentUser, OptionalUser, authorize_download, get_owned_task, uid_of,
+)
 from app.core.logger import logger
 from app.infrastructure.repositories.task_repo import task_repo
+from app.utils.signed_url import sign_url, verify_url
+from app.utils.url_signer import sign_deep
 
 router = APIRouter(tags=["Job"])
+download_router = APIRouter(tags=["Job"])
 
 _CHUNK = 1024 * 1024  # 1MB
 
 
 @router.get("/agent/v1/job/{task_id}")
-def get_job_status(task_id: str) -> dict:
-    info = task_repo.get(task_id)
-    if not info:
-        raise HTTPException(status_code=404, detail="task not found")
+def get_job_status(task_id: str, user=CurrentUser) -> dict:
+    info = get_owned_task(task_id, uid_of(user))
 
     progress_data = task_repo.get_progress(task_id) or {}
 
@@ -41,7 +50,7 @@ def get_job_status(task_id: str) -> dict:
         except Exception:
             pass
 
-    return {
+    return sign_deep({
         "task_id": task_id,
         "status": info.status,
         "progress": info.progress,
@@ -52,11 +61,28 @@ def get_job_status(task_id: str) -> dict:
         "error": info.error,
         "duration_ms": duration_ms,
         "file_size": file_size,
-    }
+        # 带签名的视频地址（前端可直接塞进 <video src>，无需改造）
+        "video_url": (
+            f"/agent/v1/job/{task_id}/video?{sign_url('job_video', task_id)}"
+            if info.status == "done" else None
+        ),
+    })
 
 
-@router.get("/agent/v1/job/{task_id}/video")
-async def get_job_video(task_id: str, request: Request):
+@download_router.get("/agent/v1/job/{task_id}/video")
+async def get_job_video(
+    task_id: str,
+    request: Request,
+    exp: str = "",
+    sig: str = "",
+    user=OptionalUser,
+):
+    authorize_download(
+        sig_ok=verify_url("job_video", task_id, exp, sig),
+        user=user,
+        check_owner=lambda uid: get_owned_task(task_id, uid),
+    )
+
     info = task_repo.get(task_id)
     if not info:
         raise HTTPException(status_code=404, detail="task not found")

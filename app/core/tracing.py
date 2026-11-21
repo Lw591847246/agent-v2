@@ -1,83 +1,41 @@
-"""统一链路追踪核心（OpenTelemetry）。
-
-设计目标
---------
-1. 零硬依赖：未安装 opentelemetry 时整体降级为 no-op，业务代码照常运行，
-   不会因为 import 失败而拖垮启动（单人调试环境可先集成代码，后装依赖）。
-2. 显式跨线程传播：threading.Thread 不继承 OTel 的 contextvar，异步后台任务
-   （TaskRunner）必须显式 capture/attach 父上下文，子任务的 span 才能挂在
-   发起它的 HTTP 请求 trace 下——这正是"长任务也能串成一条链"的关键。
-3. 与现有 RequestContext(trace_id/session_id/user_id) 并存：trace_id 继续作为
-   日志关联主键，OTel 的 trace_id/span_id 负责 span 父子关系与耗时统计，
-   两者通过 span 属性互相印证，互不替换。
-
-导出端点（按优先级，在 application.yml 的 tracing 段配置）
---------------------------------------------------------
-- tracing.otlp_endpoint 配了 -> OTLP/HTTP 导出（接 Jaeger / Tempo / OTel Collector）
-- 否则 tracing.console=true -> ConsoleSpanExporter（stdout，本地肉眼看）
-- 否则 tracing.file 路径 -> 落 JSON Lines 文件（本地留档，可后续导入 Jaeger）
-- 都没配 -> 不初始化 provider，tracing 完全 no-op
-
-公开 API
---------
-init_tracing(service_name)        进程启动时调用一次，幂等
-get_tracer(name)                 取 tracer（no-op 时返回安全替身）
-start_span / span                起 span（上下文管理器 + 装饰器两种形态）
-capture_context / attach_context / detach_context   跨线程上下文桥（给 TaskRunner 用）
-run_in_context(ctx, fn, *a, **k)  在指定上下文里执行函数并自动 detach
-current_trace_ids()              返回 (otel_trace_id, otel_span_id) 供日志注入
-"""
+"""统一链路追踪核心（OpenTelemetry）。"""
 from __future__ import annotations
 
 import functools
+import json
 import os
+import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
-# ---------- 可选依赖探测（缺失即全链路 no-op，不抛） ----------
+# ---------- 可选依赖探测 ----------
 try:
     from opentelemetry import context as _otel_ctx
     from opentelemetry import trace as _otel_trace
     _OTEL_AVAILABLE = True
-except Exception:  # pragma: no cover - 环境未装 otel
+except Exception:
     _otel_ctx = None
     _otel_trace = None
     _OTEL_AVAILABLE = False
 
-# 全局是否已完成 provider 初始化
 _initialized = False
 _last_error: Optional[str] = None
-
-_NOOP = None  # no-op span 单例（占位对象，所有方法空转）
+_provider_ref = None  # 保存 init 时创建的 SDK provider，供 shutdown 用
 
 
 class _NoopSpan:
-    """otel 不可用时返回的替身 span：所有方法空转、不抛。"""
     is_recording = False
-
-    def set_attribute(self, *a, **k):  # noqa: D401
-        return self
-
-    def set_attributes(self, *a, **k):
-        return self
-
-    def add_event(self, *a, **k):
-        return self
-
-    def record_exception(self, *a, **k):
-        return self
-
-    def end(self, *a, **k):
-        return self
-
-    def get_span_context(self):
-        return None
+    def set_attribute(self, *a, **k): return self
+    def set_attributes(self, *a, **k): return self
+    def add_event(self, *a, **k): return self
+    def record_exception(self, *a, **k): return self
+    def end(self, *a, **k): return self
+    def set_status(self, *a, **k): return self
+    def get_span_context(self): return None
 
 
 class _NoopTracer:
-    def start_span(self, *a, **k):
-        return _NoopSpan()
-
+    def start_span(self, *a, **k): return _NoopSpan()
     def start_as_current_span(self, *a, **k):
         @contextmanager
         def _cm():
@@ -85,8 +43,51 @@ class _NoopTracer:
         return _cm()
 
 
-_NOOP_SPAN = _NoopSpan()
 _NOOP_TRACER = _NoopTracer()
+
+
+class JSONLinesSpanExporter:
+    """把 span 按 JSON Lines 落盘（SDK 官方没有 FileSpanExporter，这里自实现）。"""
+
+    def __init__(self, path: str):
+        self._path = os.path.abspath(path)
+        self._lock = threading.Lock()
+        dir_ = os.path.dirname(self._path)
+        if dir_:
+            os.makedirs(dir_, exist_ok=True)
+
+    def _to_dict(self, s) -> dict:
+        ctx = s.get_span_context()
+        parent = getattr(s, "parent", None)
+        return {
+            "name": s.name,
+            "trace_id": format(ctx.trace_id, "032x") if ctx else "",
+            "span_id": format(ctx.span_id, "016x") if ctx else "",
+            "parent_span_id": format(parent.span_id, "016x") if parent else "",
+            "start_time": getattr(s, "start_time", 0),
+            "end_time": getattr(s, "end_time", 0),
+            "attributes": dict(s.attributes or {}),
+            "status": str(getattr(getattr(s, "status", None), "status", "")),
+        }
+
+    def export(self, spans):
+        try:
+            from opentelemetry.sdk.trace.export import SpanExportResult
+        except Exception:
+            return None
+        try:
+            with self._lock, open(self._path, "a", encoding="utf-8") as f:
+                for s in spans:
+                    f.write(json.dumps(self._to_dict(s), ensure_ascii=False) + "\n")
+            return SpanExportResult.SUCCESS
+        except Exception:
+            return SpanExportResult.FAILURE
+
+    def shutdown(self):
+        pass
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return True
 
 
 def _build_exporter(cfg):
@@ -108,33 +109,42 @@ def _build_exporter(cfg):
                 )
             )
         except Exception as e:
-            # OTLP 包没装或不可达 -> 退到 console，至少不静默丢失
             print(f"[Tracing] OTLP exporter 不可用，退回 console: {e}")
             return BatchSpanProcessor(ConsoleSpanExporter())
 
     if cfg.get("console", False):
-        return BatchSpanProcessor(ConsoleSpanExporter())
+        # 本地调试：SimpleSpanProcessor 让 span end 立即打印，不等 batch
+        return SimpleSpanProcessor(ConsoleSpanExporter())
 
     file_path = (cfg.get("file") or "").strip()
     if file_path:
-        # 落 JSON Lines：每条 span 一行，便于离线导入 Jaeger / 用 jq 分析
-        from opentelemetry.sdk.trace.export.file_span_exporter import (
-            FileSpanExporter,
-        )
-        os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
-        return SimpleSpanProcessor(
-            FileSpanExporter(
-                out_dir=os.path.dirname(os.path.abspath(file_path)),
-                result_callback=None,
-            )
-        )
+        return SimpleSpanProcessor(JSONLinesSpanExporter(file_path))
 
     return None
 
 
-def init_tracing(service_name: str = "agent-v2", cfg: Optional[dict] = None) -> bool:
-    """进程启动时调用一次。返回是否真正启用了 OTel。幂等。"""
-    global _initialized, _last_error
+def _instrument_all(app):
+    """在 provider 就绪后统一安装 auto-instrument。"""
+    if app is not None:
+        try:
+            from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+            FastAPIInstrumentor.instrument_app(app)
+        except Exception as e:
+            print(f"[Tracing] FastAPI instrument 失败: {e}")
+    try:
+        from opentelemetry.instrumentation.requests import RequestsInstrumentor
+        RequestsInstrumentor().instrument()
+    except Exception as e:
+        print(f"[Tracing] Requests instrument 失败: {e}")
+
+
+def init_tracing(service_name: str = "agent-v2", cfg: Optional[dict] = None, app=None) -> bool:
+    """进程启动时调用一次。返回是否真正启用了 OTel。幂等。
+
+    app 传入时，会在 provider 就绪后自动安装 FastAPI / Requests instrument，
+    避免"instrument 先于 provider set 导致 no-op"的时序问题。
+    """
+    global _initialized, _last_error, _provider_ref
     if _initialized:
         return _OTEL_AVAILABLE and _last_error is None
 
@@ -171,7 +181,8 @@ def init_tracing(service_name: str = "agent-v2", cfg: Optional[dict] = None) -> 
         provider = TracerProvider(resource=resource)
         provider.add_span_processor(processor)
         _otel_trace.set_tracer_provider(provider)
-        # W3C TraceContext：跨进程/线程标准传播器
+        _provider_ref = provider
+
         try:
             from opentelemetry import propagate
             propagate.set_global_textmap(TraceContextTextMapPropagator())
@@ -181,6 +192,9 @@ def init_tracing(service_name: str = "agent-v2", cfg: Optional[dict] = None) -> 
         _initialized = True
         _last_error = None
         print(f"[Tracing] OpenTelemetry 已启用 service={service_name}")
+
+        # 关键顺序：provider set 之后再 instrument
+        _instrument_all(app)
         return True
     except Exception as e:
         _last_error = f"init_tracing 失败: {e}"
@@ -189,17 +203,19 @@ def init_tracing(service_name: str = "agent-v2", cfg: Optional[dict] = None) -> 
         return False
 
 
-def _provider():
-    if not _OTEL_AVAILABLE:
-        return None
+def shutdown_tracing():
+    """关闭 tracer provider（只对 SDK provider 生效；no-op 时安全返回）。"""
+    global _provider_ref
+    if not _OTEL_AVAILABLE or not _initialized or _provider_ref is None:
+        return
     try:
-        return _otel_trace.get_tracer_provider()
+        _provider_ref.shutdown()
     except Exception:
-        return None
+        pass
+    _provider_ref = None
 
 
 def get_tracer(name: str = "agent"):
-    """取 tracer；OTel 不可用时返回 no-op 替身。"""
     if not _OTEL_AVAILABLE:
         return _NOOP_TRACER
     try:
@@ -208,30 +224,30 @@ def get_tracer(name: str = "agent"):
         return _NOOP_TRACER
 
 
-# ---------- span：上下文管理器 + 装饰器 ----------
-
 @contextmanager
 def span(name: str, tracer_name: str = "agent", attributes: Optional[dict] = None):
-    """with span('xxx') as sp: ...  —— OTel 不可用时安全空转。"""
     tracer = get_tracer(tracer_name)
     cm = tracer.start_as_current_span(name)
+    sp = cm.__enter__()
     try:
-        sp = cm.__enter__()
         if attributes:
             try:
                 sp.set_attributes(attributes)
             except Exception:
                 pass
+        yield sp
+    except Exception as e:
         try:
-            yield sp
-        except Exception as e:
+            sp.record_exception(e)
             try:
-                sp.record_exception(e)
+                from opentelemetry.trace import Status, StatusCode
+                sp.set_status(Status(StatusCode.ERROR, str(e)[:500]))
+            except Exception:
                 sp.set_attribute("error", True)
                 sp.set_attribute("error.message", str(e)[:500])
-            except Exception:
-                pass
-            raise
+        except Exception:
+            pass
+        raise
     finally:
         try:
             cm.__exit__(None, None, None)
@@ -240,7 +256,6 @@ def span(name: str, tracer_name: str = "agent", attributes: Optional[dict] = Non
 
 
 def traced(name: Optional[str] = None, tracer_name: str = "agent"):
-    """装饰器：with traced()(func) 或 @traced('name') 包裹函数为 span。"""
     def deco(fn: Callable):
         span_name = name or fn.__name__
         @functools.wraps(fn)
@@ -248,7 +263,6 @@ def traced(name: Optional[str] = None, tracer_name: str = "agent"):
             with span(span_name, tracer_name):
                 return fn(*args, **kwargs)
         return wrapper
-    # 兼容 @traced 不带括号
     if callable(name):
         f = name
         name = None
@@ -256,11 +270,7 @@ def traced(name: Optional[str] = None, tracer_name: str = "agent"):
     return deco
 
 
-# ---------- 跨线程上下文桥（给 TaskRunner / 任何子线程用） ----------
-
 def capture_context():
-    """在当前线程捕获 OTel 上下文快照，可带到子线程 attach。
-    OTel 不可用时返回 None（桥接自动 no-op）。"""
     if not _OTEL_AVAILABLE:
         return None
     try:
@@ -270,7 +280,6 @@ def capture_context():
 
 
 def attach_context(ctx):
-    """在目标线程把上下文快照设为当前，返回 detach token。"""
     if not _OTEL_AVAILABLE or ctx is None:
         return None
     try:
@@ -289,7 +298,6 @@ def detach_context(token):
 
 
 def run_in_context(ctx, fn: Callable, *args, **kwargs):
-    """在指定上下文快照内执行 fn，自动 attach/detach；用于子线程入口。"""
     token = attach_context(ctx)
     try:
         return fn(*args, **kwargs)
@@ -298,7 +306,6 @@ def run_in_context(ctx, fn: Callable, *args, **kwargs):
 
 
 def current_trace_ids() -> tuple:
-    """返回当前 (otel_trace_id, otel_span_id) 的十六进制串；no-op 时 ('','')."""
     if not _OTEL_AVAILABLE:
         return "", ""
     try:
