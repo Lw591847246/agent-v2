@@ -208,7 +208,12 @@ ollama:
     intent_large: "qwen2.5:14b-instruct-q4_K_M"
     chat: "qwen2.5:7b"
     reasoning: deepseek-r1:14b
-    code: deepseek-coder-v2:16b
+#    code: deepseek-coder-v2:16b
+    # 用于日常快速代码编写
+    code_fast: "deepseek-coder:6.7b"
+    # 用于复杂代码重构，带 Think 过程
+    code_think: "deepseek-r1:8b"
+
     vision: qwen2.5vl:7b
     ocr: qwen2.5vl:7b
     embedding: bge-m3:latest
@@ -218,10 +223,13 @@ ollama:
     intent_large: "0"
     chat: "30m"
     reasoning: "0"
-    code: "0"
+#    code: "0"
     vision: "0"
     ocr: "0"
     embedding: "0"
+    code_fast: "0"
+    code_think: "0"
+
 
   default_num_ctx: 16384
   default_temperature: 0.6
@@ -365,7 +373,7 @@ tts:
     timeout: 6000
 
 tracing:
-  console: true
+  console: false
   service: agent-v2
   otlp_endpoint: ""
   version: dev

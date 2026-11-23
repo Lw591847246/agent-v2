@@ -1,5 +1,5 @@
 # app/context/reference_resolver.py
-"""多轮引用解析：从 history 的 outputs 里挑出“上一轮/第N张/上上轮”的产出。"""
+"""多轮引用解析：从 history 的 outputs 里挑出"上一轮/第N张/上上轮"的产出。"""
 from __future__ import annotations
 
 import re
@@ -40,10 +40,13 @@ _TURN_PATTERNS = [
 
 _INDEX_PATTERN = re.compile(r"第\s*([一二三四五六七八九十\d]+)\s*(张|个|条|份)")
 
+# ⭐ 修复：text 关键词补上 故事/小说/正文/段落/作文，
+#    否则"把上一轮的故事做成..."会因 image/video/text 都不命中而落到默认 kind=image，
+#    导致需要文本引用的场景被错判成找图片。
 _KIND_PATTERNS = {
     "image": re.compile(r"图|图片|照片|画面|image|picture|photo"),
     "video": re.compile(r"视频|短片|video|clip"),
-    "text": re.compile(r"文案|文字|内容|文本|text"),
+    "text": re.compile(r"文案|文字|内容|文本|text|故事|小说|正文|段落|作文|这篇|这段|那段"),
 }
 
 _FIRST_PATTERN = re.compile(r"最早|最开?始|第一次|首张|第1")

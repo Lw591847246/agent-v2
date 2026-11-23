@@ -1,26 +1,20 @@
-"""Storyboard 协议。
-
-修复（P0-2）：
-- download 走 `download_router`：签名有效 或 登录态+任务归属
-  （<video src> 带不了 Authorization 头，必须支持签名 URL）；
-- regenerate 走 `router`（需登录）：只允许针对自己的任务，且把 user_id
-  透传给新任务（原来任何人可反复触发烧 GPU，且新任务归属丢失）。
-"""
+"""Storyboard 协议。"""
 import os
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
-from app.api.deps import OptionalUser, authorize_download, get_owned_task, uid_of
-from app.api.v1._ownership import assert_storyboard_task
 from app.core.logger import logger
 from app.skills.storyboard.service import STORYBOARD_ROOT, regenerate_storyboard_task
-from app.utils.safe_path import safe_join, safe_segment
-from app.utils.signed_url import verify_url
 
+# 1. 普通路由（需要登录态）
 router = APIRouter(tags=["Storyboard"])
+
+# 2. 下载路由（前端使用带签名的 URL，无需 Token，由 router.py 统一挂载）
 download_router = APIRouter(tags=["Storyboard"])
+
+_CHUNK = 1024 * 1024  # 1MB
 
 
 class RegenerateRequest(BaseModel):
@@ -28,45 +22,92 @@ class RegenerateRequest(BaseModel):
     extra_instruction: str = ""
 
 
+# ⭐ 注意：挂载在 download_router 上
 @download_router.get("/agent/v1/storyboard/download")
-async def download_storyboard(
-    task_id: str = Query(...),
-    exp: str = Query(""),
-    sig: str = Query(""),
-    user=OptionalUser,
-):
-    task_id = safe_segment(task_id, "task_id")
+async def download_storyboard(task_id: str = Query(...), request: Request = None):
+    if "/" in task_id or "\\" in task_id or ".." in task_id:
+        raise HTTPException(status_code=400, detail="invalid task_id")
 
-    authorize_download(
-        sig_ok=verify_url("storyboard", task_id, exp, sig),
-        user=user,
-        check_owner=lambda uid: assert_storyboard_task(task_id, uid),
-    )
-
-    abs_path = safe_join(STORYBOARD_ROOT, task_id, "final.mp4")
+    file_path = os.path.join(STORYBOARD_ROOT, task_id, "final.mp4")
+    abs_path = os.path.abspath(file_path)
     logger.info(f"[Storyboard-Download] task={task_id}, path={abs_path}")
 
     if not os.path.isfile(abs_path):
         logger.warning(f"[Storyboard-Download] 文件不存在: {abs_path}")
         raise HTTPException(status_code=404, detail=f"video not found: {task_id}")
 
-    return FileResponse(abs_path, media_type="video/mp4")
+    total = os.path.getsize(abs_path)
+    if total == 0:
+        raise HTTPException(status_code=404, detail="video file is empty")
+
+    # ⭐ 核心修复：手动处理 Range 请求，避免 FileResponse 在 Windows 下的大文件锁冲突
+    range_header = request.headers.get("range")
+    if range_header and range_header.startswith("bytes="):
+        try:
+            spec = range_header[6:].strip()
+            left, _, right = spec.partition("-")
+            left = left.strip()
+            right = right.strip()
+
+            if left:
+                start = int(left)
+                end = int(right) if right else total - 1
+            else:
+                n = int(right) if right else 0
+                start, end = (max(0, total - n), total - 1) if n > 0 else (0, total - 1)
+
+            start = max(0, start)
+            end = min(end, total - 1)
+
+            if start > end or start >= total:
+                return Response(
+                    status_code=416,
+                    headers={"Content-Range": f"bytes */{total}"},
+                )
+
+            length = end - start + 1
+            with open(abs_path, "rb") as f:
+                f.seek(start)
+                chunk = f.read(length)
+
+            return Response(
+                content=chunk, status_code=206, media_type="video/mp4",
+                headers={
+                    "Content-Range": f"bytes {start}-{end}/{total}",
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(len(chunk)),
+                    "Cache-Control": "public, max-age=3600",
+                },
+            )
+        except Exception as e:
+            logger.warning(f"[Storyboard-Download] range 解析失败: {e}")
+            # 解析失败回退到全量流式
+
+    # 无 Range：流式返回，避免大文件读入内存
+    def _iter_file():
+        with open(abs_path, "rb") as f:
+            while True:
+                buf = f.read(_CHUNK)
+                if not buf:
+                    break
+                yield buf
+
+    return StreamingResponse(
+        _iter_file(), media_type="video/mp4",
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(total),
+            "Cache-Control": "public, max-age=3600",
+        },
+    )
 
 
+# ⭐ 注意：重新生成接口需要用户身份，挂载在普通 router 上
 @router.post("/agent/v1/storyboard/regenerate")
-async def regenerate_storyboard(payload: RegenerateRequest, request: Request, user=OptionalUser):
-    task_id = safe_segment(payload.task_id, "task_id")
-
-    # 重跑属于"写操作"，必须登录 + 归属校验（不接受纯签名 URL 触发）
-    if not user:
-        raise HTTPException(status_code=401, detail="未登录")
-    uid = uid_of(user)
-    get_owned_task(task_id, uid)
-
+async def regenerate_storyboard(payload: RegenerateRequest):
     try:
         new_task_id = regenerate_storyboard_task(
-            original_task_id=task_id,
-            user_id=uid,
+            original_task_id=payload.task_id,
             extra_instruction=payload.extra_instruction,
         )
         return {

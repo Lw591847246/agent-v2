@@ -56,9 +56,9 @@ class OllamaClient:
         """
         connect = config.get("ollama.timeout.connect", 8)
         if stream:
-            read = config.get("ollama.timeout.read_stream", 120)
+            read = config.get("ollama.timeout.read_stream", 300)
         else:
-            read = config.get("ollama.timeout.read_chat", 180)
+            read = config.get("ollama.timeout.read_chat", 300)
         return (connect, read)
 
     def _build_payload(self, model_key: str, messages: list, stream: bool, keep_alive: str, format: str,
@@ -104,8 +104,13 @@ class OllamaClient:
                 res.raise_for_status()
 
                 data = res.json()
-                t.from_ollama_response(data)  # 从原始 dict 里取 token
-                return data.get("message", {}).get("content", "")
+                t.from_ollama_response(data)
+                msg = data.get("message", {}) or {}
+                thinking = (msg.get("thinking") or "").strip()
+                content = (msg.get("content") or "").strip()
+                if thinking:
+                    return f"<think>\n{thinking}\n</think>\n\n{content}"
+                return content
             except requests.exceptions.RequestException as e:
                 logger.error(f"【OllamaClient】请求失败: {e}")
                 raise
@@ -130,9 +135,17 @@ class OllamaClient:
                         if line:
                             data = json.loads(line)
                             t.from_ollama_chunk(data)
-                            chunk = data.get("message", {}).get("content", "")
-                            if chunk:
-                                yield chunk
+                            msg = data.get("message", {}) or {}
+                            thinking_chunk = msg.get("thinking")
+                            content_chunk = msg.get("content")
+
+                            if thinking_chunk:
+                                # 流式时把思考内容直接输出
+                                yield thinking_chunk
+                            if content_chunk:
+                                # 如果前面没吐过开标签，这里可以做个标记，简单起见直接吐正文
+                                yield content_chunk
+
                             if data.get("done"):
                                 break
             except requests.exceptions.Timeout as e:
