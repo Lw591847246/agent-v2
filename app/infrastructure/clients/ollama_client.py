@@ -2,6 +2,7 @@ import requests
 import json
 from app.config.loader import config
 from app.core.logger import logger
+from app.config.loader import config
 
 
 class LLMTimeoutError(Exception):
@@ -66,9 +67,20 @@ class OllamaClient:
         model = config.get(f"ollama.models.{model_key}")
         if not model:
             raise ValueError(f"未配置模型: ollama.models.{model_key}")
-        # 防呆："-1" 自动补全为 "-1m"，防止 Ollama 报错
         if str(keep_alive) == "-1":
             keep_alive = "-1m"
+
+        num_predict = int(
+            config.get(f"ollama.num_predict.{model_key}",
+                       config.get("ollama.num_predict.default", 4096))
+        )
+
+        # num_ctx 四级回落：num_ctx.{model_key} -> num_ctx.default -> default_num_ctx -> 32768
+        num_ctx = int(
+            config.get(f"ollama.num_ctx.{model_key}",
+                       config.get("ollama.num_ctx.default",
+                                  config.get("ollama.default_num_ctx", 32768)))
+        )
 
         payload = {
             "model": model,
@@ -77,9 +89,9 @@ class OllamaClient:
             "keep_alive": keep_alive,
             "options": {
                 "temperature": temperature,
-                "num_ctx": 16384,
-                "num_predict": 4096
-            }
+                "num_ctx": num_ctx,
+                "num_predict": num_predict,
+            },
         }
         if format == "json":
             payload["format"] = "json"

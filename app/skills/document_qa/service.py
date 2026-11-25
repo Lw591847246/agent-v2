@@ -1,16 +1,26 @@
-"""文档问答业务：解析文档 + LLM 回答。"""
+# app/skills/document_qa/service.py
+"""文档问答业务：解析文档 + LLM 回答。
+
+本版改动（不依赖向量库路线 P0）
+--------------------------------
+旧实现对超过 12000 字的文档做**头部暴力截断**，导致上传整库代码（dump 85 万字）时
+模型只看到开头目录壳，于是"未找到相关内容"。改为：
+1. 取消固定 12000 头部截断，改为**按 token 预算的头尾保留**（保住开头结构与结尾结论）；
+2. 预算从配置 agent.context.qa_doc_max_tokens 读取，缺省 14000；
+3. 在 prompt 里声明"文档可能已按预算压缩"，避免模型把省略当成"内容不存在"而误判。
+真正的"整库按需理解"由 code 链路的项目地图 + 多轮追问完成（见 skills/code）。
+"""
 from __future__ import annotations
 
 import os
 
+from app.config.loader import config
 from app.core.logger import logger
 from app.infrastructure.clients.ollama_client import ollama_client
 from app.skills.document_qa.prompts import QA_SYSTEM_PROMPT
+from app.utils.context_budget import fit
 from app.utils.file_parser import extract_text_from_file
 from app.utils.file_registry import file_registry
-
-
-_MAX_DOC_CHARS = 12000
 
 
 class DocumentQaService:
@@ -23,11 +33,19 @@ class DocumentQaService:
 
         logger.info(f"[DocumentQA] 文档解析成功，长度={len(text)}")
 
-        if len(text) > _MAX_DOC_CHARS:
-            logger.info(f"[DocumentQA] 文档截断 {len(text)} → {_MAX_DOC_CHARS}")
-            text = text[:_MAX_DOC_CHARS] + "\n...(文档过长已截断)"
+        max_tokens = int(config.get("agent.context.qa_doc_max_tokens", 14000) or 14000)
+        before = len(text)
+        text = fit(text, max_tokens, keep="head_tail",
+                   marker="\n...[文档过长，已按上下文预算压缩中间 {omitted} 字；"
+                          "如需被省略部分请点名提问]...\n")
+        if len(text) != before:
+            logger.info(f"[DocumentQA] 文档按预算压缩 {before} 字 -> {len(text)} 字"
+                        f"（预算 {max_tokens} token）")
 
-        user_msg = f"文档内容：\n{text}\n\n问题：{question}"
+        user_msg = (
+            "文档内容如下（超长时中间可能被省略；若问题恰好落在被省略部分，"
+            f"请回答'该部分未在当前上下文内'而不是臆测）：\n{text}\n\n问题：{question}"
+        )
 
         try:
             return ollama_client.chat(
@@ -50,17 +68,14 @@ class DocumentQaService:
         if not meta:
             logger.warning(f"[DocumentQA] file_registry 中找不到 file_id={file_id}")
             return ""
-        logger.info(f"[DocumentQA] file_registry 命中: meta={meta}")
-
         path = meta.get("path")
         name = meta.get("name", "doc")
         if not path:
-            logger.warning(f"[DocumentQA] meta 中没有 path 字段")
+            logger.warning("[DocumentQA] meta 中没有 path 字段")
             return ""
         if not os.path.isfile(path):
             logger.warning(f"[DocumentQA] 本地文件不存在: {path}")
             return ""
-
         try:
             with open(path, "rb") as f:
                 content = f.read()

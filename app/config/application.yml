@@ -230,9 +230,32 @@ ollama:
     code_fast: "0"
     code_think: "0"
 
+  num_predict:
+    intent: 512              # L1/L2 意图分类只需 JSON，512 够
+    intent_large: 1024
+    chat: 2048
+    code_fast: 2048
+    code_think: 6144         # ⭐ think + 7 段输出，4096 可能不够
+    vision: 1024
+    ocr: 1024
+    reasoning: 4096
+    default: 4096            # 兜底
+  num_ctx:
+    default: 16384
+    chat: 16384
+    code_fast: 32768      # 8GB 显存实测可用；OOM 则下调到 24576/16384
+    code_think: 32768
 
   default_num_ctx: 16384
   default_temperature: 0.6
+
+code:
+  history_max_turns: 40          # 历史最多取这么多条（真正装多少由 token 预算裁决）
+  history_max_tokens: 6000       # 近窗对话 token 预算（替代旧版写死的 4000 字）
+  project_map_max_tokens: 12000  # 项目地图预算
+  task_state_max_tokens: 600     # 任务态注入预算
+  module_map_max_tokens: 6000
+  code_slices_max_tokens: 6000
 
 # ==========================================
 # 数据库与中间件（密钥走环境变量 / .env）
@@ -333,13 +356,14 @@ agent:
   enabled: true
   context:
     enabled: true
-    window_size: 10
     summary_trigger_count: 6
     summary_max_chars: 800
     summary_async: true
     summary_service: chat
     summary_model_key: chat
     summary_timeout_sec: 120
+    qa_doc_max_tokens: 14000     # document_qa 不再固定 12000 头部截断
+    window_size: 12              # 近窗从 10 提到 12（配合更大 num_ctx）
 
 doc_processing:
   max_context_tokens: 8192
@@ -403,5 +427,29 @@ security:
 #   SIGNED_URL_SECRET=<openssl rand -hex 32>
 #   SIGNED_URL_DEFAULT_TTL=604800
 #   SIGNED_URL_ALLOW_LEGACY_PERMANENT=true    # 灰度期兼容 exp=0 老链接，收口后置 false
+
+code_workspace:
+  ttl_hours: 24
+  max_total_mb: 200
+  max_file_mb: 2
+  max_files: 3000
+  upload_batch_files: 30
+
+code_scan:
+  map_model: code_fast
+  reduce_model: code_think
+  chunk_tokens: 1200
+  chunk_overlap_tokens: 120
+  map_max_tokens: 800
+  reduce_max_tokens: 2000
+  retry: 2
+  token_est_ratio: 3
+  yield_sleep_ms: 150
+
+code_context:
+  recent_turns: 12
+  max_context_tokens: 6000
+  summary_trigger_tokens: 4000
+
 
 

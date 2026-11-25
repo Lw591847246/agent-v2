@@ -10,6 +10,12 @@ class AppException(Exception):
         super().__init__(self.message)
 
 
+class BadRequestException(AppException):
+    """请求参数错误异常（HTTP 400）"""
+    def __init__(self, detail: str = None):
+        super().__init__(ErrorCode.PARAM_ERROR, detail)
+
+
 class AuthException(AppException):
     def __init__(self, detail: str = None):
         super().__init__(ErrorCode.UNAUTHORIZED, detail)

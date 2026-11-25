@@ -1,5 +1,14 @@
 # app/scheduler/prompts/intent_prompts.py
-"""L2 意图 Prompt：按 domain 细分，要求输出 params。"""
+"""L2 意图 Prompt：按 domain 细分，要求输出 params。
+
+本版修复（路由根因 P0 配套）
+--------------------------
+1. general：把 code_generation 的边界写清——"带代码文件附件的分析/审查/找bug/
+   报错/重构/改代码" 必须命中 code_generation，不要因为没有"写"字就退回 chat，
+   也不要因为带附件就以为要去 content（附件是源码时仍是 code_generation）。
+2. content：加护栏——若诉求是对代码/工程做分析/审查/修改/找bug/重构，
+   输出 OUT_OF_DOMAIN（交回 general 的 code_generation），严禁用 document_qa 兜。
+"""
 
 # ============================================================
 # 通用规则（每个 domain prompt 尾部会复用）
@@ -12,11 +21,13 @@ _PARAMS_RULE = """
 - 无法确定的字段不要输出
 """
 
+
 GENERAL_PROMPT = """你在 general 领域内判断具体意图。可选意图：
 
-- chat: 闲聊、通用问答、写故事/文章/诗歌
+- chat: 闲聊、通用问答、写故事/文章/诗歌、解释代码含义（只解释不改动）
 - english_chat: 用英文聊天、练英语口语
-- code_generation: 写代码、改代码、代码审查、重构
+- code_generation: 写代码、改代码、代码审查、找bug/分析bug、重构、排查报错、
+  以及"上传了代码工程/源码文件后，要求分析它有哪些bug/哪里有问题/帮我改/帮我加功能/重构"
 - translation: 翻译（用户明确说"翻译成X语"）
 - utility: 本地小工具（不需要联网），包括：
   * 日期时间查询：今天几号、现在几点、今天星期几
@@ -36,7 +47,12 @@ GENERAL_PROMPT = """你在 general 领域内判断具体意图。可选意图：
 4. "最近新闻"、"苹果股价" → web_search
 5. "翻译成英文/日文" → translation；否则 chat，不要因为文本含外文就判翻译
 6. "朗读/配音/生成语音" → tts
-7. 闲聊、问答、写代码 → chat / code_generation
+7. 涉及"代码/程序/工程/项目/脚本/源码/bug/报错/重构/审查/review/改这段/实现" →
+   **code_generation**。这条优先于 chat。
+   ⭐ 特别注意：用户【上传了代码/源码文件（可能是 .txt/.py/.js/.md 等）】并说
+   "帮我分析一下代码还有哪些bug / 看看这个工程哪里有问题 / 帮我改一下 / 增加XX功能"
+   —— 这是 code_generation，不是 chat，也不要因为带附件就怀疑该走文档问答。
+8. 只有纯闲聊、与代码无关的通用问答、写文章故事 → chat。
 
 ## needs_agent 判断
 单步骤永远 false；只有明确"串联两个以上独立工具"才是 true。
@@ -45,7 +61,9 @@ GENERAL_PROMPT = """你在 general 领域内判断具体意图。可选意图：
 按 intent 对应参数：
 - translation: {"text": "...", "target_lang": "英文|日文|..."}
 - tts: {"text": "...", "voices": ""}
-- code_generation: {"requirement": "...", "language": ""}
+- code_generation: {"requirement": "用户对代码的完整诉求原文（含'分析bug/改哪'等）",
+                    "language": "用户指定的语言，没有则空"}
+  ⚠️ 不要输出 file_id 字段，附件由系统自动注入。
 
 ## 输出格式（严格 JSON）
 {"intent": "chat|english_chat|code_generation|translation|utility|tts|web_search", "confidence": 0.0-1.0, "needs_agent": false, "reasoning": "一句话", "params": {}}
@@ -54,19 +72,26 @@ GENERAL_PROMPT = """你在 general 领域内判断具体意图。可选意图：
 
 CONTENT_PROMPT = """你在 content 领域内判断具体意图。可选意图：
 
-- document_qa: 针对上传的文档进行提问、解释章节、查找内容
-- document_summarize: 概括、提取、整理上传文档的内容（不导出文件）
+- document_qa: 针对上传的【文档】进行提问、解释章节、查找内容
+- document_summarize: 概括、提取、整理上传【文档】的内容（不导出文件）
 - ppt_generation: 生成 PPT / 演示文稿 / 幻灯片 / slides
 - word_generation: 生成 Word 文档 / docx / 导出成文档文件
 - knowledge_query: 查询知识库
 - mindmap: 生成思维导图
 - prototype: 生成产品原型 / 网页原型 / HTML 设计稿
 
+## 🚨 护栏（先看这条）
+如果用户的真实诉求是【对代码/程序/工程/项目/脚本/源码】做：分析 / 审查 / 找bug /
+有没有问题 / 报错怎么修 / 重构 / 优化 / 改代码 / 加功能 / 实现，
+则【不要】用 document_qa/document_summarize 兜底，直接输出：
+{"intent": "OUT_OF_DOMAIN", ...}
+（这类代码任务属于 general 领域的 code_generation，应由上游交回 general 处理。）
+
 ## 判断规则
 1. 明确"生成PPT/做PPT/演示文稿/slides" → ppt_generation
 2. 明确"生成Word/做Word/docx/导出文档/保存成文档" → word_generation
-3. 有文档附件 + "提问/总结/概括/提取/分析/第三章" → document_qa
-4. 有文档附件 + "概括/提取要点/整理成报告" → document_summarize
+3. 有文档附件 +【针对文档正文内容】"提问/总结/概括/提取/分析这篇文档/第三章" → document_qa
+4. 有文档附件 +【针对文档正文】"概括/提取要点/整理成报告" → document_summarize
 5. "查知识库/知识库里有什么/关于XX的资料" → knowledge_query
 6. "思维导图/脑图/知识树" → mindmap
 7. "产品原型/网页原型/HTML设计/页面设计" → prototype
@@ -76,6 +101,7 @@ CONTENT_PROMPT = """你在 content 领域内判断具体意图。可选意图：
 - "这份文档里XX是什么/第三章讲了什么/解释XX" → document_qa
 - "总结/概括/提取要点/整理成报告" → document_summarize
 - "总结后导出Word/PPT" → document_summarize + needs_agent=true
+- 注意区分"分析这篇【文档/报告/书】" vs "分析这份【代码/工程】"：后者是代码任务 → OUT_OF_DOMAIN。
 
 ## needs_agent 判断
 - "提取文档数据再生成PPT" → true

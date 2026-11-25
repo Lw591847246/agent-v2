@@ -28,6 +28,7 @@ from app.api.v1 import (
     tts_controller,
     upload_controller,
     word_controller,
+    code_workspace_controller,
 )
 
 # ---------- 1. 需登录 ----------
@@ -48,6 +49,7 @@ for _mod in (
     knowledge_controller,
     skill_download_controller,
     sign_controller,
+    code_workspace_controller,
 ):
     protected.include_router(_mod.router)
 
@@ -73,3 +75,4 @@ for _mod in (
 api_router = APIRouter()
 api_router.include_router(protected)
 api_router.include_router(public)
+protected.include_router(_mod.router)
